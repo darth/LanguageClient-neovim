@@ -2434,6 +2434,8 @@ impl State {
 
                 let stderr = logger::open(&get_logpath_server())?;
 
+                let rootPath = get_rootPath(Path::new(&filename), &languageId, &self.rootMarkers)?;
+
                 let process = std::process::Command::new(command
                     .get(0)
                     .ok_or_else(|| err_msg("Empty command!"))?)
@@ -2441,6 +2443,7 @@ impl State {
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(stderr)
+                    .current_dir(&rootPath)
                     .spawn()?;
 
                 let child_id = Some(process.id());
