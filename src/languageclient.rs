@@ -1663,19 +1663,24 @@ impl State {
         // Unify name to avoid mismatch due to case insensitivity.
         let filename = filename.canonicalize();
 
-        self.update(|state| {
-            state
-                .diagnostics
-                .insert(filename.clone(), params.diagnostics.clone());
-            Ok(())
-        })?;
+        // Make sure error comes after warning.
+        let mut diagnostics = params.diagnostics.clone();
+        diagnostics.sort_by_key(|d| {
+            (
+                d.range.start.line,
+                -(d.severity.map_or(4, |s| s.to_int().unwrap_or(4)) as i64),
+            )
+        });
+
+        self.diagnostics
+            .insert(filename.clone(), diagnostics.clone());
         self.update_quickfixlist()?;
 
         let current_filename: String = self.eval(VimVar::Filename)?;
         if filename != current_filename.canonicalize() {
             return Ok(());
         }
-        self.display_diagnostics(&current_filename, &params.diagnostics)?;
+        self.display_diagnostics(&current_filename, &diagnostics)?;
         self.call::<_, u8>(None, "s:ExecuteAutocmd", "LanguageClientDiagnosticsChanged")?;
 
         info!("End {}", lsp::notification::PublishDiagnostics::METHOD);
