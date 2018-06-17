@@ -2,6 +2,45 @@ if get(g:, 'LanguageClient_loaded')
     finish
 endif
 
+function! s:SetDiagnostics(diag) abort
+    let g:LanguageClient_diagnostics = copy(a:diag)
+    call LanguageClient#updateCurrentDiagnosticsList()
+endfunction
+
+function! LanguageClient#getCurrentDiagnostics() abort
+    let problems = copy(get(g:, 'LanguageClient_diagnostics', []))
+    let current_filename = LSP#filename()
+    call filter(problems, 'v:val.filename ==# current_filename')
+    return problems
+endfunction
+
+function! LanguageClient#updateCurrentDiagnosticsList() abort
+    if &bt !=# '' || &ft ==# ''
+        return
+    endif
+    let problems = LanguageClient#getCurrentDiagnostics()
+    let ltype = get(g:, 'LanguageClient_diagnosticsList', 'Quickfix')
+    if ltype ==# 'Quickfix'
+        call setqflist(problems, ' ', 'LanguageClient')
+    elseif ltype ==# 'Location'
+        call setloclist(0, problems, ' ', 'LanguageClient')
+    endif
+endfunction
+
+function LanguageClient#handleBufEnter() abort
+    if get(g:, 'LanguageClient_updateDiagList', 0) == 1
+      call LanguageClient#updateCurrentDiagnosticsList()
+    endif
+endfunction
+
+function LanguageClient#handleBufLeave() abort
+  if &bt !=# '' || &ft ==# ''
+    let g:LanguageClient_updateDiagList = 0
+  else
+    let g:LanguageClient_updateDiagList = 1
+  endif
+endfunction
+
 function! s:Echo(message) abort
     echo a:message
 endfunction

@@ -110,6 +110,8 @@ augroup languageClient
     autocmd TextChanged * call LanguageClient#handleTextChanged()
     autocmd TextChangedI * call LanguageClient#handleTextChanged()
     autocmd CursorMoved * call LanguageClient#handleCursorMoved()
+    autocmd BufEnter * call LanguageClient#handleBufEnter()
+    autocmd BufLeave * call LanguageClient#handleBufLeave()
     if get(g:, 'LanguageClient_autoStop', 1)
       autocmd VimLeavePre * call LanguageClient#exit()
     endif

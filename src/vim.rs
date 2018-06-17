@@ -282,6 +282,13 @@ impl State {
         Ok(())
     }
 
+    pub fn setdiagnostics(&mut self, list: &[QuickfixEntry]) -> Result<()> {
+        if self.call::<_, u8>(None, "s:SetDiagnostics", json!([list]))? != 0 {
+            bail!("Failed to set diagnostics!");
+        }
+        Ok(())
+    }
+
     pub fn setqflist(&mut self, list: &[QuickfixEntry]) -> Result<()> {
         if self.call::<_, u8>(None, "setqflist", json!([list, "r"]))? != 0 {
             bail!("Failed to set quickfix list!");

@@ -304,15 +304,7 @@ impl State {
             })
             .collect();
 
-        match self.diagnosticsList {
-            DiagnosticsList::Quickfix => {
-                self.setqflist(&qflist)?;
-            }
-            DiagnosticsList::Location => {
-                self.setloclist(&qflist)?;
-            }
-            DiagnosticsList::Disabled => {}
-        }
+        self.setdiagnostics(&qflist)?;
 
         Ok(())
     }
