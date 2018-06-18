@@ -7,7 +7,7 @@ let s:spc = g:airline_symbols.space
 
 let s:error_symbol = get(g:, 'airline#extensions#languageclient#error_symbol', 'E:')
 let s:warning_symbol = get(g:, 'airline#extensions#languageclient#warning_symbol', 'W:')
-let s:show_line_numbers = get(g:, 'airline#extensions#languageclient#show_line_numbers', 1)
+let s:show_line_numbers = get(g:, 'airline#extensions#languageclient#show_line_numbers', 0)
 
 function! s:airline_languageclient_count(cnt, symbol)
   return a:cnt ? a:symbol. a:cnt : ''
@@ -65,6 +65,20 @@ function! airline#extensions#languageclient#get_error()
   return airline#extensions#languageclient#get('error')
 endfunction
 
+function! airline#extensions#languageclient#status()
+  if has_key(g:LanguageClient_serverCommands, &ft)
+    let msg = 'LSP:' . s:spc
+    if get(g:, 'LanguageClient_started', 0) == 1
+      let msg .= ''
+    else
+      let msg .= ''
+    endif
+    return s:spc.g:airline_right_alt_sep.s:spc.msg.s:spc
+  else
+    return ''
+  endif
+endfunction
+
 function! airline#extensions#languageclient#init(ext)
   call a:ext.add_statusline_func('airline#extensions#languageclient#apply')
   augroup airline_languageclient
@@ -74,6 +88,8 @@ function! airline#extensions#languageclient#init(ext)
 endfunction
 
 function! airline#extensions#languageclient#apply(...)
+  let w:airline_section_x = get(w:, 'airline_section_x', g:airline_section_x)
+  let w:airline_section_x .= '%{airline#extensions#languageclient#status()}'
   let w:airline_section_error = get(w:, 'airline_section_error', g:airline_section_error)
   let w:airline_section_error .= '%{airline#extensions#languageclient#get_error()}'
   let w:airline_section_warning = get(w:, 'airline_section_warning', g:airline_section_warning)
