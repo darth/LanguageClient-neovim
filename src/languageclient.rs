@@ -48,10 +48,17 @@ impl State {
     }
 
     fn sync_settings(&mut self) -> Result<()> {
-        let loggingFile: Option<String> =
-            self.eval("get(g:, 'LanguageClient_loggingFile', v:null)")?;
-        let loggingLevel: log::LevelFilter =
-            self.eval("get(g:, 'LanguageClient_loggingLevel', 'WARN')")?;
+        let (loggingFile, loggingLevel, serverStderr): (
+            Option<String>,
+            log::LevelFilter,
+            Option<String>,
+        ) = self.eval(
+            [
+                "get(g:, 'LanguageClient_loggingFile', v:null)",
+                "get(g:, 'LanguageClient_loggingLevel', 'WARN')",
+                "get(g:, 'LanguageClient_serverStderr', v:null)",
+            ].as_ref(),
+        )?;
         logger::update_settings(&self.logger, &loggingFile, &loggingLevel)?;
 
         #[allow(unknown_lints)]
@@ -186,6 +193,7 @@ impl State {
             state.completionPreferTextEdit = completionPreferTextEdit;
             state.loggingFile = loggingFile;
             state.loggingLevel = loggingLevel;
+            state.serverStderr = serverStderr;
             state.is_nvim = is_nvim;
             Ok(())
         })?;
@@ -195,7 +203,7 @@ impl State {
 
     fn get_workspace_settings(&self, root: &str) -> Result<Value> {
         if !self.loadSettings {
-            return Ok(json!({}));
+            return Ok(Value::Null);
         }
 
         let buffer = read_to_string(Path::new(root).join(self.settingsPath.clone()))?;
@@ -359,6 +367,7 @@ impl State {
                 })
                 .collect();
             signs.sort_unstable();
+            signs.dedup_by_key(|s| s.line);
 
             let cmd = self.update(|state| {
                 let signs_prev = state.signs.remove(filename).unwrap_or_default();
@@ -654,12 +663,12 @@ impl State {
             .map(|s| s["initializationOptions"].clone())
             .unwrap_or_else(|err| {
                 warn!("Failed to get initializationOptions: {}", err);
-                json!({})
+                json!(Value::Null)
             });
         let initialization_options =
             get_default_initializationOptions(&languageId).combine(initialization_options);
 
-        let trace = self.get(|state| Ok(state.trace.clone()))?;
+        let trace = self.trace.clone();
 
         let result: Value = self.call(
             Some(&languageId),
@@ -1655,19 +1664,24 @@ impl State {
         // Unify name to avoid mismatch due to case insensitivity.
         let filename = filename.canonicalize();
 
-        self.update(|state| {
-            state
-                .diagnostics
-                .insert(filename.clone(), params.diagnostics.clone());
-            Ok(())
-        })?;
+        // Make sure error comes after warning.
+        let mut diagnostics = params.diagnostics.clone();
+        diagnostics.sort_by_key(|d| {
+            (
+                d.range.start.line,
+                -(d.severity.map_or(4, |s| s.to_int().unwrap_or(4)) as i64),
+            )
+        });
+
+        self.diagnostics
+            .insert(filename.clone(), diagnostics.clone());
         self.update_quickfixlist()?;
 
         let current_filename: String = self.eval(VimVar::Filename)?;
         if filename != current_filename.canonicalize() {
             return Ok(());
         }
-        self.display_diagnostics(&current_filename, &params.diagnostics)?;
+        self.display_diagnostics(&current_filename, &diagnostics)?;
         self.call::<_, u8>(None, "s:ExecuteAutocmd", "LanguageClientDiagnosticsChanged")?;
 
         info!("End {}", lsp::notification::PublishDiagnostics::METHOD);
@@ -2432,7 +2446,14 @@ impl State {
                     })
                     .collect();
 
-                let stderr = logger::open(&get_logpath_server())?;
+                let stderr = match self.serverStderr {
+                    Some(ref path) => std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)?
+                        .into(),
+                    None => Stdio::null(),
+                };
 
                 let rootPath = get_rootPath(Path::new(&filename), &languageId, &self.rootMarkers)?;
 
@@ -2494,14 +2515,14 @@ impl State {
         self.initialized(&params)?;
 
         let root = self.roots.get(&languageId).cloned().unwrap_or_default();
-        let settings = self.get_workspace_settings(&root);
-        if let Err(ref err) = settings {
-            warn!("Failed to get workspace settings: {}", err);
+        match self.get_workspace_settings(&root) {
+            Ok(Value::Null) => (),
+            Ok(settings) => self.workspace_didChangeConfiguration(&json!({
+                VimVar::LanguageId.to_key(): languageId,
+                "settings": settings,
+            }).to_params()?)?,
+            Err(err) => warn!("Failed to get workspace settings: {}", err),
         }
-        self.workspace_didChangeConfiguration(&json!({
-            VimVar::LanguageId.to_key(): languageId,
-            "settings": settings.unwrap_or_else(|_| json!({})),
-        }).to_params()?)?;
 
         self.textDocument_didOpen(&params)?;
         self.textDocument_didChange(&params)?;
