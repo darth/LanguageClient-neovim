@@ -347,10 +347,15 @@ function! LanguageClient#binaryPath() abort
 endfunction
 
 function! s:Launch() abort
-    let l:command = [LanguageClient#binaryPath()]
+    let l:binpath = LanguageClient#binaryPath()
+
+    if executable(l:binpath) != 1
+        call s:Echoerr('LanguageClient: binary (' . l:binpath . ') doesn''t exists! Please check installation guide.')
+        return 0
+    endif
 
     if has('nvim')
-        let s:job = jobstart(l:command, {
+        let s:job = jobstart([l:binpath], {
                     \ 'on_stdout': function('s:HandleMessage'),
                     \ 'on_stderr': function('s:HandleMessage'),
                     \ 'on_exit': function('s:HandleMessage'),
@@ -365,7 +370,7 @@ function! s:Launch() abort
             return 1
         endif
     elseif has('job')
-        let s:job = job_start(l:command, {
+        let s:job = job_start([l:binpath], {
                     \ 'out_cb': function('s:HandleStdoutVim'),
                     \ 'err_cb': function('s:HandleStderrVim'),
                     \ 'exit_cb': function('s:HandleExitVim'),
