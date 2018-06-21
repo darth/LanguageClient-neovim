@@ -68,7 +68,7 @@ endfunction
 function! airline#extensions#languageclient#status()
   if has_key(g:LanguageClient_serverCommands, &ft)
     let msg = 'LSP:' . s:spc
-    if get(g:, 'LanguageClient_started', 0) == 1
+    if g:LanguageClient_running[&ft]
       let msg .= ''
     else
       let msg .= ''
