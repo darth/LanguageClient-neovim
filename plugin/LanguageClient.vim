@@ -123,3 +123,8 @@ augroup languageClient
                     \ call LanguageClient#textDocument_signatureHelp({}, 's:HandleOutputNothing')
     endif
 augroup END
+
+if !exists('g:LanguageClient_serverCommands')
+    let g:LanguageClient_serverCommands = {}
+endif
+let g:LanguageClient_running = map(copy(g:LanguageClient_serverCommands), 0)

@@ -50,6 +50,7 @@ pub const CommandsClient: &[&str] = &["java.apply.workspaceEdit"];
 // Vim variable names
 pub const VIM__ServerStatus: &str = "g:LanguageClient_serverStatus";
 pub const VIM__ServerStatusMessage: &str = "g:LanguageClient_serverStatusMessage";
+pub const VIM__Running: &str = "g:LanguageClient_running";
 
 /// Thread safe read.
 pub trait SyncRead: BufRead + Sync + Send + Debug {}

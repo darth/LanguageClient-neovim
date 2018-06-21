@@ -598,6 +598,7 @@ impl State {
         self.text_documents.retain(|f, _| !f.starts_with(&root));
         self.roots.remove(languageId);
 
+        self.command(&format!("let {}['{}']=0", VIM__Running, languageId))?;
         self.call::<_, u8>(None, "s:ExecuteAutocmd", "LanguageClientStopped")?;
         self.command(&format!("let {}=0", VIM__ServerStatus))?;
         self.command(&format!("let {}=''", VIM__ServerStatusMessage))?;
@@ -2528,6 +2529,7 @@ impl State {
         self.textDocument_didChange(&params)?;
 
         self.call::<_, u8>(None, "s:ExecuteAutocmd", "LanguageClientStarted")?;
+        self.command(&format!("let {}['{}'] = 1", VIM__Running, languageId))?;
         Ok(Value::Null)
     }
 
