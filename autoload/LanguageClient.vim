@@ -27,17 +27,27 @@ function! LanguageClient#updateCurrentDiagnosticsList() abort
     endif
 endfunction
 
-function LanguageClient#handleBufEnter() abort
+function! LanguageClient#handleBufEnter() abort
     if get(g:, 'LanguageClient_updateDiagList', 0) == 1
       call LanguageClient#updateCurrentDiagnosticsList()
     endif
 endfunction
 
-function LanguageClient#handleBufLeave() abort
+function! LanguageClient#handleBufLeave() abort
   if &bt !=# '' || &ft ==# ''
     let g:LanguageClient_updateDiagList = 0
   else
     let g:LanguageClient_updateDiagList = 1
+  endif
+endfunction
+
+function! LanguageClient#toggle() abort
+  if has_key(g:LanguageClient_running, &ft)
+    if g:LanguageClient_running[&ft]
+      call LanguageClient#exit()
+    else
+      call LanguageClient#startServer()
+    endif
   endif
 endfunction
 

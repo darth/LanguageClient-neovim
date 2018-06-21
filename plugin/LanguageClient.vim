@@ -100,6 +100,7 @@ endfunction
 
 command! -nargs=* LanguageClientStart :call LanguageClient#startServer(<f-args>)
 command! LanguageClientStop :call LanguageClient#exit()
+command! LanguageClientToggle :call LanguageClient#toggle()
 
 augroup languageClient
     autocmd!
