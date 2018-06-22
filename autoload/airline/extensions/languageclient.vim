@@ -83,7 +83,10 @@ function! airline#extensions#languageclient#init(ext)
   call a:ext.add_statusline_func('airline#extensions#languageclient#apply')
   augroup airline_languageclient
     autocmd!
-    autocmd CursorHold,BufWritePost * call <sid>languageclient_refresh()
+    autocmd User LanguageClientDiagnosticsSet
+    \ if get(g:, 'airline_skip_empty_sections', 0) |
+    \   AirlineRefresh |
+    \ endif |
   augroup END
 endfunction
 
@@ -94,10 +97,4 @@ function! airline#extensions#languageclient#apply(...)
   let w:airline_section_error .= '%{airline#extensions#languageclient#get_error()}'
   let w:airline_section_warning = get(w:, 'airline_section_warning', g:airline_section_warning)
   let w:airline_section_warning .= '%{airline#extensions#languageclient#get_warning()}'
-endfunction
-
-function! s:languageclient_refresh()
-  if get(g:, 'airline_skip_empty_sections', 0)
-    exe ':AirlineRefresh'
-  endif
 endfunction
