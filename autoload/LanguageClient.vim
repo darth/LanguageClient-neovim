@@ -4,7 +4,6 @@ endif
 
 function! s:SetDiagnostics(diag) abort
     let g:LanguageClient_diagnostics = copy(a:diag)
-    call s:ExecuteAutocmd('LanguageClientDiagnosticsSet')
     call LanguageClient#updateCurrentDiagnosticsList()
 endfunction
 

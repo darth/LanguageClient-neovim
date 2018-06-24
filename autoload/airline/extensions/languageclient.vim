@@ -83,7 +83,7 @@ function! airline#extensions#languageclient#init(ext)
   call a:ext.add_statusline_func('airline#extensions#languageclient#apply')
   augroup airline_languageclient
     autocmd!
-    autocmd User LanguageClientDiagnosticsSet
+    autocmd User LanguageClientDiagnosticsChanged
     \ if get(g:, 'airline_skip_empty_sections', 0) |
     \   AirlineRefresh |
     \ endif |
