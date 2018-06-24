@@ -2,6 +2,15 @@ if get(g:, 'LanguageClient_loaded')
     finish
 endif
 
+function! s:LanguageClient_isRunning() abort
+  for lang in keys(g:LanguageClient_running)
+    if g:LanguageClient_running[lang]
+      return 1
+    endif
+  endfor
+  return 0
+endfunction
+
 function! s:SetDiagnostics(diag) abort
     let g:LanguageClient_diagnostics = copy(a:diag)
     call LanguageClient#updateCurrentDiagnosticsList()
@@ -15,7 +24,7 @@ function! LanguageClient#getCurrentDiagnostics() abort
 endfunction
 
 function! LanguageClient#updateCurrentDiagnosticsList() abort
-    if &bt !=# '' || &ft ==# ''
+    if &bt !=# '' || &ft ==# '' || !s:LanguageClient_isRunning()
         return
     endif
     let problems = LanguageClient#getCurrentDiagnostics()
