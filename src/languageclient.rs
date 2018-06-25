@@ -2085,8 +2085,9 @@ impl State {
         if lines.is_empty() {
             err_msg("No selection!");
         }
+        let cmd = lines.get(0).ok_or_else(|| format_err!("Failed to get action! lines: {:?}", lines))?.to_owned();
         let mut tokens: Vec<&str> = lines
-            .get(0)
+            .get(1)
             .ok_or_else(|| format_err!("Failed to get line! lines: {:?}", lines))?
             .split(':')
             .collect();
@@ -2110,7 +2111,7 @@ impl State {
             .ok_or_else(|| format_err!("Failed to get character! tokens: {:?}", tokens))?
             .to_int()? - 1;
 
-        self.edit(&None, &filename)?;
+        self.edit(&Some(cmd), &filename)?;
         self.jump(line + 1, character + 1)?;
 
         info!("End {}", NOTIFICATION__FZFSinkLocation);
