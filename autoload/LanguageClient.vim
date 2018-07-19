@@ -117,7 +117,7 @@ function! s:hasSnippetSupport() abort
         return 1
     endif
     " https://github.com/garbas/vim-snipmate
-    if exists('loaded_snips')
+    if exists('g:loaded_snips')
         return 1
     endif
 
@@ -183,13 +183,25 @@ function! s:FZF(source, sink) abort
 endfunction
 
 function! s:Edit(action, path) abort
+    " If editing current file, push current location to jump list.
+    if bufnr(a:path) == bufnr('%')
+        execute 'normal m`'
+    endif
+
     let l:action = a:action
-    " Avoid the not saved warning.
+    " Avoid the 'not saved' warning.
     if l:action ==# 'edit' && bufnr(a:path) != -1
         let l:action = 'buffer'
     endif
 
     execute l:action . ' ' . fnameescape(a:path)
+endfunction
+
+" Batch version of `matchdelete()`.
+function! s:MatchDelete(ids) abort
+    for l:id in a:ids
+        call matchdelete(l:id)
+    endfor
 endfunction
 
 let s:id = 1
@@ -299,7 +311,7 @@ function! s:HandleMessage(job, lines, event) abort
         if type(a:lines) == type(0) && a:lines == 0
             return
         endif
-        call s:Echoerr('LanguageClient exited with: ' . string(a:lines))
+        call s:Debug('LanguageClient exited with: ' . string(a:lines))
     else
         call s:Debug('LanguageClient unknown event: ' . a:event)
     endif
@@ -603,10 +615,21 @@ function! LanguageClient#textDocument_rangeFormatting(...) abort
     return LanguageClient#Call('textDocument/rangeFormatting', l:params, l:callback)
 endfunction
 
+function! LanguageClient#completionItem_resolve(completion_item, ...)
+    let l:callback = get(a:000, 1, v:null)
+    let l:params = {
+                \ 'completionItem': a:completion_item,
+                \ 'handle': s:IsFalse(l:callback)
+                \ }
+    call extend(l:params, get(a:000, 0, {}))
+    return LanguageClient#Call('completionItem/resolve', l:params, l:callback)
+endfunction
+
 function! LanguageClient#textDocument_rangeFormatting_sync(...) abort
-    return !LanguageClient_runSync('LanguageClient#textDocument_rangeFormatting', {
+    let l:result = LanguageClient_runSync('LanguageClient#textDocument_rangeFormatting', {
                 \ 'handle': v:true,
                 \ })
+    return l:result isnot v:null
 endfunction
 
 function! LanguageClient#rustDocument_implementations(...) abort
@@ -802,6 +825,8 @@ function! LanguageClient#handleCompleteDone() abort
         call LanguageClient#Notify('languageClient/handleCompleteDone', {
                     \ 'filename': LSP#filename(),
                     \ 'completed_item': v:completed_item,
+                    \ 'line': LSP#line(),
+                    \ 'character': LSP#character(),
                     \ })
     catch
         call s:Debug('LanguageClient caught exception: ' . string(v:exception))
@@ -830,6 +855,12 @@ endfunction
 function! LanguageClient_NCMRefresh(info, context) abort
     return LanguageClient#Call('LanguageClient_NCMRefresh', {
                 \ 'info': a:info,
+                \ 'ctx': a:context,
+                \ }, v:null)
+endfunction
+
+function! LanguageClient_NCM2OnComplete(context) abort
+    return LanguageClient#Call('LanguageClient_NCM2OnComplete', {
                 \ 'ctx': a:context,
                 \ }, v:null)
 endfunction

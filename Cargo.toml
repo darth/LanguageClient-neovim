@@ -1,6 +1,6 @@
 [package]
 name = "languageclient"
-version = "0.1.91"
+version = "0.1.101"
 authors = ["Junfeng Li <autozimu@gmail.com>"]
 description = "Language Server Protocol (LSP) support for vim and neovim"
 publish = false
@@ -10,7 +10,6 @@ failure = "0"
 log = "0.4"
 log4rs = "0"
 structopt = "0"
-libc = "0"
 maplit = "1"
 
 serde = "1"

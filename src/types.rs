@@ -17,6 +17,7 @@ pub const REQUEST__OmniComplete: &str = "languageClient/omniComplete";
 pub const REQUEST__SetLoggingLevel: &str = "languageClient/setLoggingLevel";
 pub const REQUEST__RegisterHandlers: &str = "languageClient/registerHandlers";
 pub const REQUEST__NCMRefresh: &str = "LanguageClient_NCMRefresh";
+pub const REQUEST__NCM2OnComplete: &str = "LanguageClient_NCM2OnComplete";
 pub const REQUEST__ExplainErrorAtPoint: &str = "$languageClient/explainErrorAtPoint";
 pub const NOTIFICATION__HandleBufNewFile: &str = "languageClient/handleBufNewFile";
 pub const NOTIFICATION__HandleBufReadPost: &str = "languageClient/handleBufReadPost";
@@ -90,7 +91,7 @@ pub struct State {
 
     pub child_ids: HashMap<String, u32>,
     #[serde(skip_serializing)]
-    pub writers: HashMap<String, Box<SyncWrite>>,
+    pub writers: HashMap<String, Box<dyn SyncWrite>>,
     pub capabilities: HashMap<String, Value>,
     pub registrations: Vec<Registration>,
     pub roots: HashMap<String, String>,
@@ -102,6 +103,8 @@ pub struct State {
     pub line_diagnostics: HashMap<(String, u64), String>,
     pub signs: HashMap<String, Vec<Sign>>,
     pub highlight_source: Option<u64>,
+    // TODO: make file specific.
+    pub highlight_match_ids: Vec<u32>,
     pub user_handlers: HashMap<String, String>,
     #[serde(skip_serializing)]
     pub watchers: HashMap<String, notify::RecommendedWatcher>,
@@ -121,6 +124,7 @@ pub struct State {
     pub diagnosticsEnable: bool,
     pub diagnosticsList: DiagnosticsList,
     pub diagnosticsDisplay: HashMap<u64, DiagnosticsDisplay>,
+    pub diagnosticsSignsMax: Option<u64>,
     pub windowLogMessageLevel: MessageType,
     pub settingsPath: String,
     pub loadSettings: bool,
@@ -161,6 +165,7 @@ impl State {
             line_diagnostics: HashMap::new(),
             signs: HashMap::new(),
             highlight_source: None,
+            highlight_match_ids: Vec::new(),
             user_handlers: HashMap::new(),
             watchers: HashMap::new(),
             watcher_rxs: HashMap::new(),
@@ -177,6 +182,7 @@ impl State {
             diagnosticsEnable: true,
             diagnosticsList: DiagnosticsList::Quickfix,
             diagnosticsDisplay: DiagnosticsDisplay::default(),
+            diagnosticsSignsMax: None,
             windowLogMessageLevel: MessageType::Warning,
             settingsPath: format!(".vim{}settings.json", std::path::MAIN_SEPARATOR),
             loadSettings: false,
@@ -184,7 +190,7 @@ impl State {
             change_throttle: None,
             wait_output_timeout: Duration::from_secs(10),
             hoverPreview: HoverPreviewOption::default(),
-            completionPreferTextEdit: true,
+            completionPreferTextEdit: false,
             loggingFile: None,
             loggingLevel: log::LevelFilter::Warn,
             serverStderr: None,
@@ -430,6 +436,19 @@ pub struct NCMRefreshParams {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct NCM2Context {
+    pub bufnr: u64,
+    pub lnum: u64,
+    pub ccol: u64,
+    pub filetype: String,
+    pub typed: String,
+    pub filepath: String,
+    pub scope: String,
+    pub startccol: u64,
+    pub base: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct VimCompleteItem {
     pub word: String,
     pub abbr: String,
@@ -444,6 +463,7 @@ pub struct VimCompleteItem {
     pub snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_snippet: Option<bool>,
+    // NOTE: `user_data` can only be string in vim. So cannot specify concrete type here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_data: Option<String>,
 }
@@ -451,24 +471,48 @@ pub struct VimCompleteItem {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VimCompleteItemUserData {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text_edit: Option<TextEdit>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub additional_text_edits: Option<Vec<lsp::TextEdit>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub snippet: Option<String>,
+    pub lspitem: Option<CompletionItem>,
 }
 
-impl VimCompleteItemUserData {
-    pub fn new() -> Self {
-        Self {
-            text_edit: None,
-            additional_text_edits: None,
-            snippet: None,
-        }
-    }
+impl FromLSP<CompletionItem> for VimCompleteItem {
+    fn from_lsp(lspitem: &CompletionItem) -> Result<VimCompleteItem> {
+        let abbr = lspitem.label.clone();
+        let word = lspitem
+            .insert_text
+            .clone()
+            .unwrap_or_else(|| lspitem.label.clone());
 
-    pub fn is_none(&self) -> bool {
-        self.text_edit.is_none() && self.additional_text_edits.is_none() && self.snippet.is_none()
+        let is_snippet;
+        let snippet;
+        if lspitem.insert_text_format == Some(InsertTextFormat::Snippet) {
+            is_snippet = Some(true);
+            snippet = Some(word.clone());
+        } else {
+            is_snippet = None;
+            snippet = None;
+        };
+
+        let mut info = String::new();
+        if let Some(ref doc) = lspitem.documentation {
+            info += &doc.to_string();
+        }
+
+        let user_data = VimCompleteItemUserData {
+            lspitem: Some(lspitem.clone()),
+        };
+
+        Ok(VimCompleteItem {
+            word,
+            abbr,
+            icase: Some(1),
+            dup: Some(1),
+            menu: lspitem.detail.clone().unwrap_or_default(),
+            info,
+            kind: lspitem.kind.map(|k| format!("{:?}", k)).unwrap_or_default(),
+            snippet,
+            is_snippet,
+            user_data: Some(serde_json::to_string(&user_data)?),
+        })
     }
 }
 
@@ -926,59 +970,6 @@ impl FromLSP<SymbolInformation> for QuickfixEntry {
             text: Some(sym.name.clone()),
             nr: None,
             typ: None,
-        })
-    }
-}
-
-impl FromLSP<CompletionItem> for VimCompleteItem {
-    fn from_lsp(lspitem: &CompletionItem) -> Result<Self> {
-        let abbr = lspitem.label.clone();
-        let word = lspitem
-            .insert_text
-            .clone()
-            .unwrap_or_else(|| lspitem.label.clone());
-
-        let mut user_data = VimCompleteItemUserData::new();
-
-        let is_snippet;
-        let snippet;
-        if lspitem.insert_text_format == Some(InsertTextFormat::Snippet) {
-            is_snippet = Some(true);
-            snippet = Some(word.clone());
-            user_data.snippet = Some(word.clone());
-        } else {
-            is_snippet = None;
-            snippet = None;
-        };
-
-        let mut info = String::new();
-        if let Some(ref doc) = lspitem.documentation {
-            info += &doc.to_string();
-        }
-
-        // TODO: check completionPreferTextEdit.
-        if lspitem.text_edit.is_some() {
-            user_data.text_edit = lspitem.text_edit.clone();
-        }
-        if lspitem.additional_text_edits.is_some() {
-            user_data.additional_text_edits = lspitem.additional_text_edits.clone();
-        }
-
-        Ok(VimCompleteItem {
-            word,
-            abbr,
-            icase: Some(1),
-            dup: Some(1),
-            menu: lspitem.detail.clone().unwrap_or_default(),
-            info,
-            kind: lspitem.kind.map(|k| format!("{:?}", k)).unwrap_or_default(),
-            snippet,
-            is_snippet,
-            user_data: if user_data.is_none() {
-                None
-            } else {
-                Some(serde_json::to_string(&user_data)?)
-            },
         })
     }
 }

@@ -59,7 +59,7 @@ impl State {
                 "get(g:, 'LanguageClient_serverStderr', v:null)",
             ].as_ref(),
         )?;
-        logger::update_settings(&self.logger, &loggingFile, &loggingLevel)?;
+        logger::update_settings(&self.logger, &loggingFile, loggingLevel)?;
 
         #[allow(unknown_lints)]
         #[allow(type_complexity)]
@@ -113,10 +113,14 @@ impl State {
                 "get(g:, 'LanguageClient_diagnosticsDisplay', {})",
                 "get(g:, 'LanguageClient_windowLogMessageLevel', 'Warning')",
                 "get(g:, 'LanguageClient_hoverPreview', 'Auto')",
-                "get(g:, 'LanguageClient_completionPreferTextEdit', 1)",
+                "get(g:, 'LanguageClient_completionPreferTextEdit', 0)",
                 "has('nvim')",
             ].as_ref(),
         )?;
+
+        let (diagnosticsSignsMax,): (Option<u64>,) =
+            self.eval(["get(g:, 'LanguageClient_diagnosticsSignsMax', v:null)"].as_ref())?;
+
         // vimscript use 1 for true, 0 for false.
         let autoStart = autoStart == 1;
         let loadSettings = loadSettings == 1;
@@ -183,6 +187,7 @@ impl State {
             state.diagnosticsDisplay = serde_json::from_value(
                 serde_json::to_value(&state.diagnosticsDisplay)?.combine(diagnosticsDisplay),
             )?;
+            state.diagnosticsSignsMax = diagnosticsSignsMax;
             state.windowLogMessageLevel = windowLogMessageLevel;
             state.settingsPath = settingsPath;
             state.loadSettings = loadSettings;
@@ -248,7 +253,7 @@ impl State {
             }
         }
         self.edit(&None, &filename)?;
-        self.jump(line + 1, character + 1)?;
+        self.cursor(line + 1, character + 1)?;
         debug!("End apply WorkspaceEdit");
         Ok(())
     }
@@ -368,6 +373,9 @@ impl State {
                 .collect();
             signs.sort_unstable();
             signs.dedup_by_key(|s| s.line);
+            if let Some(diagnosticSignsMax) = self.diagnosticsSignsMax {
+                signs.truncate(diagnosticSignsMax as usize);
+            }
 
             let cmd = self.update(|state| {
                 let signs_prev = state.signs.remove(filename).unwrap_or_default();
@@ -379,47 +387,113 @@ impl State {
             self.command(&cmd)?;
         }
 
-        // Highlight.
-        if !self.get(|state| Ok(state.is_nvim))? {
-            return Ok(());
-        }
-
-        let mut source: Option<u64> = self.get(|state| Ok(state.highlight_source))?;
-        if source.is_none() {
-            source = Some(self.call(
-                None,
-                "nvim_buf_add_highlight",
-                json!([0, 0, "Error", 1, 1, 1]),
-            )?);
-            self.update(|state| {
-                state.highlight_source = source;
-                Ok(())
-            })?;
-        }
-        let source = source.ok_or_else(|| err_msg("Empty highlight source id"))?;
         let diagnosticsDisplay = self.get(|state| Ok(state.diagnosticsDisplay.clone()))?;
 
-        // TODO: Optimize.
-        self.call::<_, Option<u8>>(None, "nvim_buf_clear_highlight", json!([0, source, 1, -1]))?;
-        for dn in diagnostics {
-            let severity = dn.severity.unwrap_or(DiagnosticSeverity::Information);
-            let hl_group = diagnosticsDisplay
-                .get(&severity.to_int()?)
-                .ok_or_else(|| err_msg("Failed to get display"))?
-                .texthl
-                .clone();
-            self.call::<_, u8>(
+        // Highlight.
+        if self.get(|state| Ok(state.is_nvim))? {
+            let mut source: Option<u64> = self.get(|state| Ok(state.highlight_source))?;
+            if source.is_none() {
+                source = Some(self.call(
+                    None,
+                    "nvim_buf_add_highlight",
+                    json!([0, 0, "Error", 1, 1, 1]),
+                )?);
+                self.update(|state| {
+                    state.highlight_source = source;
+                    Ok(())
+                })?;
+            }
+            let source = source.ok_or_else(|| err_msg("Empty highlight source id"))?;
+
+            // TODO: Optimize.
+            self.call::<_, Option<u8>>(
                 None,
-                "nvim_buf_add_highlight",
-                json!([
-                    0,
-                    source,
-                    hl_group,
-                    dn.range.start.line,
-                    dn.range.start.character,
-                    dn.range.end.character,
-                ]),
+                "nvim_buf_clear_highlight",
+                json!([0, source, 1, -1]),
             )?;
+            for dn in diagnostics {
+                let severity = dn.severity.unwrap_or(DiagnosticSeverity::Information);
+                let hl_group = diagnosticsDisplay
+                    .get(&severity.to_int()?)
+                    .ok_or_else(|| err_msg("Failed to get display"))?
+                    .texthl
+                    .clone();
+
+                self.call::<_, u8>(
+                    None,
+                    "nvim_buf_add_highlight",
+                    json!([
+                        0,
+                        source,
+                        hl_group,
+                        dn.range.start.line,
+                        dn.range.start.character,
+                        dn.range.end.character,
+                    ]),
+                )?;
+            }
+        } else {
+            // Clear old highlights.
+            let ids = self.highlight_match_ids.clone();
+            self.notify(None, "s:MatchDelete", json!([ids]))?;
+
+            // Group diagnostics by severity so we can highlight them
+            // in a single call.
+            let mut match_groups: HashMap<_, Vec<_>> = HashMap::new();
+
+            for dn in diagnostics {
+                let severity = dn.severity
+                    .unwrap_or(DiagnosticSeverity::Information)
+                    .to_int()?;
+                match_groups
+                    .entry(severity)
+                    .or_insert_with(Vec::new)
+                    .push(dn);
+            }
+
+            let mut new_match_ids = Vec::new();
+
+            for (severity, dns) in match_groups {
+                let hl_group = diagnosticsDisplay
+                    .get(&severity)
+                    .ok_or_else(|| err_msg("Failed to get display"))?
+                    .texthl
+                    .clone();
+                let ranges: Vec<Vec<_>> = dns.iter()
+                    .flat_map(|dn| {
+                        if dn.range.start.line == dn.range.end.line {
+                            let length = dn.range.end.character - dn.range.start.character;
+                            // Vim line numbers are 1 off
+                            // `matchaddpos` expects an array of [line, col, length]
+                            // for each match.
+                            vec![vec![
+                                dn.range.start.line + 1,
+                                dn.range.start.character + 1,
+                                length,
+                            ]]
+                        } else {
+                            let mut middleLines: Vec<_> = (dn.range.start.line + 1
+                                ..dn.range.end.line)
+                                .map(|l| vec![l + 1])
+                                .collect();
+                            let startLine = vec![
+                                dn.range.start.line + 1,
+                                dn.range.start.character + 1,
+                                999_999, //Clear to the end of the line
+                            ];
+                            let endLine =
+                                vec![dn.range.end.line + 1, 1, dn.range.end.character + 1];
+                            middleLines.push(startLine);
+                            middleLines.push(endLine);
+                            middleLines
+                        }
+                    })
+                    .collect();
+
+                let match_id = self.call(None, "matchaddpos", json!([hl_group, ranges]))?;
+                new_match_ids.push(match_id);
+            }
+            self.highlight_match_ids = new_match_ids;
         }
 
         Ok(())
@@ -532,6 +606,47 @@ impl State {
         Ok(())
     }
 
+    fn registerNCM2Source(&mut self, languageId: &str, result: &Value) -> Result<()> {
+        info!("Begin register NCM2 source");
+        let exists_ncm2: u64 = self.eval("exists('g:ncm2_loaded')")?;
+        if exists_ncm2 == 0 {
+            return Ok(());
+        }
+
+        let result: InitializeResult = serde_json::from_value(result.clone())?;
+        if result.capabilities.completion_provider.is_none() {
+            return Ok(());
+        }
+
+        let trigger_patterns = result
+            .capabilities
+            .completion_provider
+            .map(|opt| {
+                let strings: Vec<_> = opt.trigger_characters
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|c| regex::escape(c))
+                    .collect();
+                strings
+            })
+            .unwrap_or_default();
+
+        self.call::<_, u8>(
+            None,
+            "ncm2#register_source",
+            json!([{
+                "name": format!("LanguageClient_{}", languageId),
+                "priority": 9,
+                "scope": [languageId],
+                "complete_pattern": trigger_patterns,
+                "mark": "LC",
+                "on_complete": REQUEST__NCM2OnComplete,
+            }]),
+        )?;
+        info!("End register NCM2 source");
+        Ok(())
+    }
+
     fn get_line<P: AsRef<Path>>(&mut self, path: P, line: u64) -> Result<String> {
         let value = self.call(
             None,
@@ -611,7 +726,7 @@ impl State {
     where
         S: AsRef<str> + Serialize,
     {
-        let bufname = "//LanguageClient";
+        let bufname = "__LanguageClient__";
 
         let mut cmd = String::new();
         cmd += "silent! pedit! +setlocal\\ buftype=nofile\\ filetype=markdown\\ nobuflisted\\ noswapfile\\ nonumber ";
@@ -668,6 +783,11 @@ impl State {
             });
         let initialization_options =
             get_default_initializationOptions(&languageId).combine(initialization_options);
+        let initialization_options = if initialization_options.is_null() {
+            None
+        } else {
+            Some(initialization_options)
+        };
 
         let trace = self.trace.clone();
 
@@ -675,10 +795,10 @@ impl State {
             Some(&languageId),
             lsp::request::Initialize::METHOD,
             InitializeParams {
-                process_id: Some(unsafe { libc::getpid() } as u64),
+                process_id: Some(u64::from(std::process::id())),
                 root_path: Some(root.clone()),
                 root_uri: Some(root.to_url()?),
-                initialization_options: Some(initialization_options),
+                initialization_options,
                 capabilities: ClientCapabilities {
                     text_document: Some(TextDocumentClientCapabilities {
                         completion: Some(CompletionCapability {
@@ -711,7 +831,13 @@ impl State {
         })?;
 
         info!("End {}", lsp::request::Initialize::METHOD);
+
         if let Err(e) = self.registerCMSource(&languageId, &result) {
+            let message = format!("LanguageClient: failed to register as NCM source: {}", e);
+            error!("{}\n{:?}", message, e);
+            self.echoerr(message)?;
+        }
+        if let Err(e) = self.registerNCM2Source(&languageId, &result) {
             let message = format!("LanguageClient: failed to register as NCM source: {}", e);
             error!("{}\n{:?}", message, e);
             self.echoerr(message)?;
@@ -837,14 +963,14 @@ impl State {
             }
             Some(GotoDefinitionResponse::Scalar(loc)) => {
                 self.edit(&goto_cmd, loc.uri.filepath()?)?;
-                self.jump(loc.range.start.line + 1, loc.range.start.character + 1)?;
+                self.cursor(loc.range.start.line + 1, loc.range.start.character + 1)?;
             }
             Some(GotoDefinitionResponse::Array(arr)) => match arr.len() {
                 0 => self.echowarn("Not found!")?,
                 1 => {
                     let loc = arr.get(0).ok_or_else(|| err_msg("Not found!"))?;
                     self.edit(&goto_cmd, loc.uri.filepath()?)?;
-                    self.jump(loc.range.start.line + 1, loc.range.start.character + 1)?;
+                    self.cursor(loc.range.start.line + 1, loc.range.start.character + 1)?;
                 }
                 _ => self.display_locations(&arr)?,
             },
@@ -955,7 +1081,13 @@ impl State {
                     .iter()
                     .map(|sym| {
                         let start = sym.location.range.start;
-                        format!("{}:{}:\t{}", start.line + 1, start.character + 1, sym.name)
+                        format!(
+                            "{}:{}:\t{}\t\t{:?}",
+                            start.line + 1,
+                            start.character + 1,
+                            sym.name,
+                            sym.kind
+                        )
                     })
                     .collect();
 
@@ -1413,11 +1545,12 @@ impl State {
                         let relpath = diff_paths(&filename, Path::new(&cwd)).unwrap_or(filename);
                         let start = sym.location.range.start;
                         Ok(format!(
-                            "{}:{}:{}:\t{}",
+                            "{}:{}:{}:\t{}\t\t{:?}",
                             relpath.to_string_lossy(),
                             start.line + 1,
                             start.character + 1,
-                            sym.name
+                            sym.name,
+                            sym.kind
                         ))
                     })
                     .collect();
@@ -1528,9 +1661,13 @@ impl State {
         )?;
 
         self.command("setlocal omnifunc=LanguageClient#complete")?;
-        if self.get(|state| Ok(state.text_documents.contains_key(&filename)))? {
-            self.call::<_, u8>(None, "s:ExecuteAutocmd", "LanguageClientBufReadPost")?;
-        }
+        let root = self.roots.get(&languageId).cloned().unwrap_or_default();
+        self.notify(
+            None,
+            "setbufvar",
+            json!([filename, "LanguageClient_projectRoot", root]),
+        )?;
+        self.notify(None, "s:ExecuteAutocmd", "LanguageClientBufReadPost")?;
 
         info!("End {}", lsp::notification::DidOpenTextDocument::METHOD);
         Ok(())
@@ -1850,7 +1987,7 @@ impl State {
     pub fn languageClient_setLoggingLevel(&mut self, params: &Option<Params>) -> Result<Value> {
         info!("Begin {}", REQUEST__SetLoggingLevel);
         let (loggingLevel,): (log::LevelFilter,) = self.gather_args(&["loggingLevel"], params)?;
-        logger::update_settings(&self.logger, &self.loggingFile, &loggingLevel)?;
+        logger::update_settings(&self.logger, &self.loggingFile, loggingLevel)?;
         self.loggingLevel = loggingLevel;
         info!("End {}", REQUEST__SetLoggingLevel);
         Ok(Value::Null)
@@ -1929,18 +2066,15 @@ impl State {
             return Ok(());
         }
 
+        let filename = filename.canonicalize();
+
         if self.get(|state| Ok(state.writers.contains_key(&languageId)))? {
             self.textDocument_didOpen(params)?;
 
-            let diagnostics = self.get(|state| {
-                state
-                    .diagnostics
-                    .get(&filename.canonicalize())
-                    .cloned()
-                    .ok_or_else(|| format_err!("No diagnostics! filename: {}", filename))
-            }).unwrap_or_default();
-            self.display_diagnostics(&filename, &diagnostics)?;
-            self.languageClient_handleCursorMoved(params)?;
+            if let Some(diagnostics) = self.diagnostics.get(&filename).cloned() {
+                self.display_diagnostics(&filename, &diagnostics)?;
+                self.languageClient_handleCursorMoved(params)?;
+            }
         } else {
             let autoStart: u8 = self.eval("!!get(g:, 'LanguageClient_autoStart', 1)")?;
             if autoStart == 1 {
@@ -2048,28 +2182,48 @@ impl State {
     }
 
     pub fn languageClient_handleCompleteDone(&mut self, params: &Option<Params>) -> Result<()> {
-        let (filename, completed_item): (String, VimCompleteItem) = self.gather_args(
-            &[VimVar::Filename.to_key().as_str(), "completed_item"],
+        let (filename, completed_item, line, character): (
+            String,
+            VimCompleteItem,
+            u64,
+            u64,
+        ) = self.gather_args(
+            &[
+                VimVar::Filename.to_key().as_str(),
+                "completed_item",
+                VimVar::Line.to_key().as_str(),
+                VimVar::Character.to_key().as_str(),
+            ],
             params,
         )?;
+
         let user_data = match completed_item.user_data {
-            Some(data) => data,
-            None => return Ok(()),
+            Some(user_data) => user_data,
+            _ => return Ok(()),
         };
         let user_data: VimCompleteItemUserData = serde_json::from_str(&user_data)?;
+        let lspitem = match user_data.lspitem {
+            Some(lspitem) => lspitem,
+            _ => return Ok(()),
+        };
 
         let mut edits = vec![];
-        if let Some(edit) = user_data.text_edit {
-            edits.push(edit.clone());
-        };
-        if let Some(aedits) = user_data.additional_text_edits {
+        if self.completionPreferTextEdit {
+            if let Some(edit) = lspitem.text_edit {
+                self.command("undo")?;
+                edits.push(edit.clone());
+            };
+        }
+        if let Some(aedits) = lspitem.additional_text_edits {
             edits.extend(aedits.clone());
         };
 
-        // TODO
-        // 1. undo previous completion
-        // 2. relocate cursor
-        self.apply_TextEdits(filename, &edits)
+        if edits.is_empty() {
+            return Ok(());
+        }
+
+        self.apply_TextEdits(filename, &edits)?;
+        self.cursor(line + 1, character + 1)
     }
 
     pub fn languageClient_FZFSinkLocation(&mut self, params: &Option<Params>) -> Result<()> {
@@ -2112,7 +2266,7 @@ impl State {
             .to_int()? - 1;
 
         self.edit(&Some(cmd), &filename)?;
-        self.jump(line + 1, character + 1)?;
+        self.cursor(line + 1, character + 1)?;
 
         info!("End {}", NOTIFICATION__FZFSinkLocation);
         Ok(())
@@ -2199,6 +2353,51 @@ impl State {
             json!([info.name, ctx, ctx.startcol, matches, is_incomplete]),
         )?;
         info!("End {}", REQUEST__NCMRefresh);
+        Ok(Value::Null)
+    }
+
+    pub fn NCM2_on_complete(&mut self, params: &Option<Params>) -> Result<Value> {
+        info!("Begin {}", REQUEST__NCM2OnComplete);
+
+        let orig_ctx: Value = serde_json::from_value(rpc::to_value(params.clone())?)?;
+        let orig_ctx = &orig_ctx["ctx"];
+
+        let ctx: NCM2Context = serde_json::from_value(orig_ctx.clone())?;
+        if ctx.typed.is_empty() {
+            return Ok(Value::Null);
+        }
+
+        let filename = ctx.filepath.clone();
+        let line = ctx.lnum - 1;
+        let character = ctx.ccol - 1;
+
+        let result = self.textDocument_completion(&json!({
+                "buftype": "",
+                "languageId": ctx.filetype,
+                "filename": filename,
+                "line": line,
+                "character": character,
+                "handle": false,
+            }).to_params()?)?;
+        let result: Option<CompletionResponse> = serde_json::from_value(result)?;
+        let result = result.unwrap_or_else(|| CompletionResponse::Array(vec![]));
+        let is_incomplete = match result {
+            CompletionResponse::Array(_) => false,
+            CompletionResponse::List(ref list) => list.is_incomplete,
+        };
+        let matches: Result<Vec<VimCompleteItem>> = match result {
+            CompletionResponse::Array(arr) => arr,
+            CompletionResponse::List(list) => list.items,
+        }.iter()
+            .map(FromLSP::from_lsp)
+            .collect();
+        let matches = matches?;
+        self.call::<_, u8>(
+            None,
+            "ncm2#complete",
+            json!([orig_ctx, ctx.startccol, matches, is_incomplete]),
+        )?;
+        info!("End {}", REQUEST__NCM2OnComplete);
         Ok(Value::Null)
     }
 
@@ -2371,8 +2570,11 @@ impl State {
     pub fn cquery_handleProgress(&mut self, params: &Option<Params>) -> Result<()> {
         info!("Begin {}", NOTIFICATION__CqueryProgress);
         let params: CqueryProgressParams = params.clone().to_lsp()?;
-        let total = params.indexRequestCount + params.doIdMapCount + params.loadPreviousIndexCount
-            + params.onIdMappedCount + params.onIndexedCount;
+        let total = params.indexRequestCount
+            + params.doIdMapCount
+            + params.loadPreviousIndexCount
+            + params.onIdMappedCount
+            + params.onIndexedCount;
         if total != 0 {
             self.command(&format!(
                 "let {}=1 | let {}='cquery: indexing ({} jobs)'",
@@ -2425,7 +2627,7 @@ impl State {
                 })
         })?;
 
-        let (child_id, reader, writer): (_, Box<SyncRead>, Box<SyncWrite>) =
+        let (child_id, reader, writer): (_, Box<dyn SyncRead>, Box<dyn SyncWrite>) =
             if command.get(0).map(|c| c.starts_with("tcp://")) == Some(true) {
                 let addr = command
                     .get(0)
@@ -2529,7 +2731,7 @@ impl State {
         self.textDocument_didOpen(&params)?;
         self.textDocument_didChange(&params)?;
 
-        self.call::<_, u8>(None, "s:ExecuteAutocmd", "LanguageClientStarted")?;
+        self.notify(None, "s:ExecuteAutocmd", "LanguageClientStarted")?;
         self.command(&format!("let {}['{}'] = 1", VIM__Running, languageId))?;
         Ok(Value::Null)
     }
