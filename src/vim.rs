@@ -31,9 +31,11 @@ impl State {
         loop {
             let msg = self.rx.recv_timeout(self.wait_output_timeout)?;
             match msg {
-                Message::MethodCall(lang_id, method_call) => self.pending_calls
+                Message::MethodCall(lang_id, method_call) => self
+                    .pending_calls
                     .push_back(Call::MethodCall(lang_id, method_call)),
-                Message::Notification(lang_id, notification) => self.pending_calls
+                Message::Notification(lang_id, notification) => self
+                    .pending_calls
                     .push_back(Call::Notification(lang_id, notification)),
                 Message::Output(output) => {
                     let mid = output.id().to_int()?;
@@ -89,7 +91,8 @@ impl State {
     fn write(&mut self, languageId: Option<&str>, message: &str) -> Result<()> {
         info!("=> {:?} {}", languageId, message);
         if let Some(languageId) = languageId {
-            let writer = self.writers
+            let writer = self
+                .writers
                 .get_mut(languageId)
                 .ok_or(LCError::NoLanguageServer {
                     languageId: languageId.to_owned(),
@@ -187,10 +190,9 @@ impl State {
         Ok(serde_json::from_value(result)?)
     }
 
-    pub fn command<S: AsRef<str>>(&mut self, cmd: S) -> Result<()> {
-        let cmd = cmd.as_ref();
-        if self.call::<_, u8>(None, "execute", cmd)? != 0 {
-            bail!("Failed to execute command: {}", cmd);
+    pub fn command<P: Serialize + Debug>(&mut self, cmds: P) -> Result<()> {
+        if self.call::<_, u8>(None, "execute", &cmds)? != 0 {
+            bail!("Failed to execute command: {:?}", cmds);
         }
         Ok(())
     }
@@ -209,8 +211,12 @@ impl State {
 
     pub fn echo_ellipsis<S: AsRef<str>>(&mut self, message: S) -> Result<()> {
         let message = message.as_ref().lines().collect::<Vec<_>>().join(" ");
-        self.call::<_, u8>(None, "s:EchoEllipsis", message)?;
-        Ok(())
+        self.notify(None, "s:EchoEllipsis", message)
+    }
+
+    pub fn echomsg_ellipsis<S: AsRef<str>>(&mut self, message: S) -> Result<()> {
+        let message = message.as_ref().lines().collect::<Vec<_>>().join(" ");
+        self.notify(None, "s:EchomsgEllipsis", message)
     }
 
     pub fn echomsg<S>(&mut self, message: S) -> Result<()>
@@ -265,10 +271,12 @@ impl State {
         if path.starts_with("jdt://") {
             self.command("setlocal buftype=nofile filetype=java noswapfile")?;
 
-            let result = self.java_classFileContents(&json!({
+            let result = self.java_classFileContents(
+                &json!({
                 VimVar::LanguageId.to_key(): "java",
                 "uri": path,
-            }).to_params()?)?;
+            }).to_params()?,
+            )?;
             let content = match result {
                 Value::String(s) => s,
                 _ => bail!("Unexpected type: {:?}", result),

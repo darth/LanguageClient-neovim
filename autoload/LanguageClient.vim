@@ -64,8 +64,7 @@ function! s:Echo(message) abort
     echo a:message
 endfunction
 
-" Echo message without trigger |hit-enter|
-function! s:EchoEllipsis(message) abort
+function s:Ellipsis(message) abort
     let l:maxlen = &columns * &cmdheight - 2
     if &showcmd
         let maxlen -= 11
@@ -78,7 +77,41 @@ function! s:EchoEllipsis(message) abort
     else
         let l:message = a:message[:l:maxlen - 3] . '...'
     endif
-    echo l:message
+    return l:message
+endfunction
+
+" `echo` message without trigger |hit-enter|
+function! s:EchoEllipsis(message) abort
+    echo s:Ellipsis(a:message)
+endfunction
+
+" `echomsg` message without trigger |hit-enter|
+function! s:EchomsgEllipsis(message) abort
+    " Credit: ALE, snippets from ale#cursor#TruncatedEcho()
+    let l:message = a:message
+    " Change tabs to spaces.
+    let l:message = substitute(l:message, "\t", ' ', 'g')
+    " Remove any newlines in the message.
+    let l:message = substitute(l:message, "\n", '', 'g')
+
+    " We need to remember the setting for shortmess and reset it again.
+    let l:shortmess_options = &l:shortmess
+    try
+        let l:cursor_position = getcurpos()
+
+        " The message is truncated and saved to the history.
+        setlocal shortmess+=T
+        exec "norm! :echomsg l:message\n"
+
+        " Reset the cursor position if we moved off the end of the line.
+        " Using :norm and :echomsg can move the cursor off the end of the
+        " line.
+        if l:cursor_position != getcurpos()
+            call setpos('.', l:cursor_position)
+        endif
+    finally
+        let &l:shortmess = l:shortmess_options
+    endtry
 endfunction
 
 function! s:Echomsg(message) abort
@@ -184,14 +217,17 @@ endfunction
 
 function! s:Edit(action, path) abort
     " If editing current file, push current location to jump list.
-    if bufnr(a:path) == bufnr('%')
+    let l:bufnr = bufnr(a:path)
+    if l:bufnr == bufnr('%')
         execute 'normal m`'
+        return
     endif
 
     let l:action = a:action
     " Avoid the 'not saved' warning.
-    if l:action ==# 'edit' && bufnr(a:path) != -1
-        let l:action = 'buffer'
+    if l:action ==# 'edit' && l:bufnr != -1
+        execute 'buffer' l:bufnr
+        return
     endif
 
     execute l:action . ' ' . fnameescape(a:path)
@@ -201,6 +237,13 @@ endfunction
 function! s:MatchDelete(ids) abort
     for l:id in a:ids
         call matchdelete(l:id)
+    endfor
+endfunction
+
+" Batch version of nvim_buf_add_highlight
+function! s:AddHighlights(source, highlights) abort
+    for hl in a:highlights
+        call nvim_buf_add_highlight(0, a:source, hl.group, hl.line, hl.character_start, hl.character_end)
     endfor
 endfunction
 
@@ -809,6 +852,8 @@ function! LanguageClient#handleCursorMoved() abort
                     \ 'buftype': &buftype,
                     \ 'filename': LSP#filename(),
                     \ 'line': l:cursor_line,
+                    \ 'LSP#visible_line_start()': LSP#visible_line_start(),
+                    \ 'LSP#visible_line_end()': LSP#visible_line_end(),
                     \ })
     catch
         call s:Debug('LanguageClient caught exception: ' . string(v:exception))
@@ -828,6 +873,16 @@ function! LanguageClient#handleCompleteDone() abort
                     \ 'line': LSP#line(),
                     \ 'character': LSP#character(),
                     \ })
+    catch
+        call s:Debug('LanguageClient caught exception: ' . string(v:exception))
+    endtry
+endfunction
+
+function! LanguageClient#handleVimLeavePre() abort
+    try
+        if get(g:, 'LanguageClient_autoStop', 1)
+            call LanguageClient#exit()
+        endif
     catch
         call s:Debug('LanguageClient caught exception: ' . string(v:exception))
     endtry

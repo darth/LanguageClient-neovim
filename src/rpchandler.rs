@@ -23,10 +23,8 @@ impl State {
             lsp::request::RegisterCapability::METHOD => {
                 self.client_registerCapability(languageId.unwrap_or_default(), &method_call.params)
             }
-            lsp::request::UnregisterCapability::METHOD => self.client_unregisterCapability(
-                languageId.unwrap_or_default(),
-                &method_call.params,
-            ),
+            lsp::request::UnregisterCapability::METHOD => self
+                .client_unregisterCapability(languageId.unwrap_or_default(), &method_call.params),
             lsp::request::HoverRequest::METHOD => self.textDocument_hover(&method_call.params),
             m @ lsp::request::GotoDefinition::METHOD
             | m @ REQUEST__CqueryBase
@@ -186,7 +184,6 @@ impl State {
                 self.rust_handleDiagnosticsEnd(&notification.params)?
             }
             NOTIFICATION__WindowProgress => self.window_progress(&notification.params)?,
-            NOTIFICATION__CqueryProgress => self.cquery_handleProgress(&notification.params)?,
             NOTIFICATION__ServerExited => self.languageClient_serverExited(&notification.params)?,
 
             _ => {

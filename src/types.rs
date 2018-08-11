@@ -42,7 +42,6 @@ pub const REQUEST__CqueryBase: &str = "$cquery/base";
 pub const REQUEST__CqueryCallers: &str = "$cquery/callers";
 pub const REQUEST__CqueryDerived: &str = "$cquery/derived";
 pub const REQUEST__CqueryVars: &str = "$cquery/vars";
-pub const NOTIFICATION__CqueryProgress: &str = "$cquery/progress";
 pub const NOTIFICATION__LanguageStatus: &str = "language/status";
 pub const REQUEST__ClassFileContents: &str = "java/classFileContents";
 
@@ -102,7 +101,10 @@ pub struct State {
     #[serde(skip_serializing)]
     pub line_diagnostics: HashMap<(String, u64), String>,
     pub signs: HashMap<String, Vec<Sign>>,
+    pub signs_placed: HashMap<String, Vec<Sign>>,
     pub highlight_source: Option<u64>,
+    pub highlights: HashMap<String, Vec<Highlight>>,
+    pub highlights_placed: HashMap<String, Vec<Highlight>>,
     // TODO: make file specific.
     pub highlight_match_ids: Vec<u32>,
     pub user_handlers: HashMap<String, String>,
@@ -164,7 +166,10 @@ impl State {
             diagnostics: HashMap::new(),
             line_diagnostics: HashMap::new(),
             signs: HashMap::new(),
+            signs_placed: HashMap::new(),
             highlight_source: None,
+            highlights: HashMap::new(),
+            highlights_placed: HashMap::new(),
             highlight_match_ids: Vec::new(),
             user_handlers: HashMap::new(),
             watchers: HashMap::new(),
@@ -329,17 +334,16 @@ impl DiagnosticsDisplay {
     }
 }
 
-// Maybe with (line, character) as key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sign {
     pub id: u64,
     pub line: u64,
     pub text: String,
-    pub severity: DiagnosticSeverity,
+    pub severity: Option<DiagnosticSeverity>,
 }
 
 impl Sign {
-    pub fn new(line: u64, text: String, severity: DiagnosticSeverity) -> Sign {
+    pub fn new(line: u64, text: String, severity: Option<DiagnosticSeverity>) -> Sign {
         Sign {
             id: Self::get_id(line, severity),
             line,
@@ -348,9 +352,13 @@ impl Sign {
         }
     }
 
-    fn get_id(line: u64, severity: DiagnosticSeverity) -> u64 {
+    fn get_id(line: u64, severity: Option<DiagnosticSeverity>) -> u64 {
         let base_id = 75_000;
-        base_id + (line - 1) * 4 + severity.to_int().unwrap_or(0) - 1
+        base_id + (line - 1) * 4
+            + severity
+                .unwrap_or(DiagnosticSeverity::Hint)
+                .to_int()
+                .unwrap_or(4) - 1
     }
 }
 
@@ -368,7 +376,7 @@ impl std::cmp::PartialOrd for Sign {
 
 impl std::cmp::PartialEq for Sign {
     fn eq(&self, other: &Self) -> bool {
-        // Dirty way to check if sign has changed.
+        // Quick check whether sign should be updated.
         self.text == other.text && self.severity == other.severity
     }
 }
@@ -379,6 +387,22 @@ use std::hash::{Hash, Hasher};
 impl Hash for Sign {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Highlight {
+    pub line: u64,
+    pub character_start: u64,
+    pub character_end: u64,
+    pub group: String,
+    pub text: String,
+}
+
+impl PartialEq for Highlight {
+    fn eq(&self, other: &Self) -> bool {
+        // Quick check whether highlight should be updated.
+        self.text == other.text && self.group == other.group
     }
 }
 
@@ -597,7 +621,8 @@ impl ToString for Hover {
     fn to_string(&self) -> String {
         match self.contents {
             HoverContents::Scalar(ref ms) => ms.to_string(),
-            HoverContents::Array(ref vec) => vec.iter()
+            HoverContents::Array(ref vec) => vec
+                .iter()
                 .map(|i| i.to_string())
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -850,15 +875,6 @@ pub struct WindowProgressParams {
     pub message: Option<String>,
     pub percentage: Option<f64>,
     pub done: Option<bool>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CqueryProgressParams {
-    pub indexRequestCount: u64,
-    pub doIdMapCount: u64,
-    pub loadPreviousIndexCount: u64,
-    pub onIdMappedCount: u64,
-    pub onIndexedCount: u64,
 }
 
 pub trait Filepath {

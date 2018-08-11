@@ -1,6 +1,6 @@
 [package]
 name = "languageclient"
-version = "0.1.101"
+version = "0.1.107"
 authors = ["Junfeng Li <autozimu@gmail.com>"]
 description = "Language Server Protocol (LSP) support for vim and neovim"
 publish = false
@@ -24,6 +24,9 @@ diff = "0"
 regex = "1"
 glob = "0"
 notify = "4"
+
+[profile.release]
+debug = true
 
 [package.metadata.release]
 no-dev-version = true
