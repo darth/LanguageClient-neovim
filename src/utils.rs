@@ -120,12 +120,9 @@ pub trait ToUrl {
 
 impl<P: AsRef<Path> + std::fmt::Debug> ToUrl for P {
     fn to_url(&self) -> Result<Url> {
-        Url::from_file_path(self).or_else(|_| {
-            Err(format_err!(
-                "Failed to convert from path ({:?}) to Url",
-                self
-            ))
-        })
+        Url::from_file_path(self)
+            .or_else(|_| Url::from_str(&self.as_ref().to_string_lossy()))
+            .or_else(|_| Err(format_err!("Failed to convert ({:?}) to Url", self)))
     }
 }
 
@@ -308,17 +305,17 @@ fn test_get_command_update_signs() {
 
 pub trait Combine {
     /// Recursively combine two objects.
-    fn combine(self, other: Self) -> Self
+    fn combine(&self, other: &Self) -> Self
     where
-        Self: Sized;
+        Self: Sized + Clone;
 }
 
 impl Combine for Value {
-    fn combine(self, other: Self) -> Self {
+    fn combine(&self, other: &Self) -> Self {
         match (self, other) {
-            (this, Value::Null) => this,
+            (this, Value::Null) => this.clone(),
             (Value::Object(this), Value::Object(other)) => {
-                let mut map = serde_json::map::Map::new();
+                let mut map = serde_json::Map::new();
                 let mut keys: HashSet<String> = HashSet::new();
                 for k in this.keys() {
                     keys.insert(k.clone());
@@ -327,15 +324,70 @@ impl Combine for Value {
                     keys.insert(k.clone());
                 }
                 for k in keys.drain() {
-                    let v1 = this.get(&k).unwrap_or(&Value::Null).clone();
-                    let v2 = other.get(&k).unwrap_or(&Value::Null).clone();
+                    let v1 = this.get(&k).unwrap_or(&Value::Null);
+                    let v2 = other.get(&k).unwrap_or(&Value::Null);
                     map.insert(k, v1.combine(v2));
                 }
                 Value::Object(map)
             }
-            (_, other) => other,
+            (_, other) => other.clone(),
         }
     }
+}
+
+/// Expand condensed json path as in VSCode.
+///
+/// e.g.,
+/// ```json
+/// {
+///   "rust.rls": true
+/// }
+/// ```
+/// will be expanded to
+/// ```json
+/// {
+///   "rust": {
+///     "rls": true
+///   }
+/// }
+/// ```
+pub fn expand_json_path(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut value_expanded = json!({});
+            for (k, v) in map {
+                let mut v = v;
+                for token in k.rsplit('.') {
+                    v = json!({ token: v });
+                }
+                value_expanded = value_expanded.combine(&v);
+            }
+            value_expanded
+        }
+        _ => value,
+    }
+}
+
+#[test]
+fn test_expand_json_path() {
+    assert_eq!(
+        expand_json_path(json!({
+            "k": "v"
+        })),
+        json!({
+            "k": "v"
+        })
+    );
+    assert_eq!(
+        expand_json_path(json!({
+            "rust.rls": true
+        })),
+        json!({
+            "rust": {
+                "rls": true
+            }
+        })
+    );
 }
 
 pub fn vim_cmd_args_to_value(args: &[String]) -> Result<Value> {

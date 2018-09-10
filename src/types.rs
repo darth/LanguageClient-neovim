@@ -15,10 +15,13 @@ pub const REQUEST__StartServer: &str = "languageClient/startServer";
 pub const REQUEST__RegisterServerCommands: &str = "languageClient/registerServerCommands";
 pub const REQUEST__OmniComplete: &str = "languageClient/omniComplete";
 pub const REQUEST__SetLoggingLevel: &str = "languageClient/setLoggingLevel";
+pub const REQUEST__SetDiagnosticsList: &str = "languageClient/setDiagnosticsList";
 pub const REQUEST__RegisterHandlers: &str = "languageClient/registerHandlers";
 pub const REQUEST__NCMRefresh: &str = "LanguageClient_NCMRefresh";
 pub const REQUEST__NCM2OnComplete: &str = "LanguageClient_NCM2OnComplete";
-pub const REQUEST__ExplainErrorAtPoint: &str = "$languageClient/explainErrorAtPoint";
+pub const REQUEST__ExplainErrorAtPoint: &str = "languageClient/explainErrorAtPoint";
+pub const REQUEST__FindLocations: &str = "languageClient/findLocations";
+pub const REQUEST__DebugInfo: &str = "languageClient/debugInfo";
 pub const NOTIFICATION__HandleBufNewFile: &str = "languageClient/handleBufNewFile";
 pub const NOTIFICATION__HandleBufReadPost: &str = "languageClient/handleBufReadPost";
 pub const NOTIFICATION__HandleTextChanged: &str = "languageClient/handleTextChanged";
@@ -28,7 +31,8 @@ pub const NOTIFICATION__HandleCursorMoved: &str = "languageClient/handleCursorMo
 pub const NOTIFICATION__HandleCompleteDone: &str = "languageClient/handleCompleteDone";
 pub const NOTIFICATION__FZFSinkLocation: &str = "LanguageClient_FZFSinkLocation";
 pub const NOTIFICATION__FZFSinkCommand: &str = "LanguageClient_FZFSinkCommand";
-pub const NOTIFICATION__ServerExited: &str = "$languageClient/serverExisted";
+pub const NOTIFICATION__ServerExited: &str = "$languageClient/serverExited";
+pub const NOTIFICATION__ClearDocumentHighlight: &str = "languageClient/clearDocumentHighlight";
 
 // Extensions by language servers.
 pub const REQUEST__RustImplementations: &str = "rustDocument/implementations";
@@ -38,10 +42,6 @@ pub const NOTIFICATION__RustDiagnosticsEnd: &str = "rustDocument/diagnosticsEnd"
 // This is an RLS extension but the name is general enough to assume it might be implemented by
 // other language servers or planned for inclusion in the base protocol.
 pub const NOTIFICATION__WindowProgress: &str = "window/progress";
-pub const REQUEST__CqueryBase: &str = "$cquery/base";
-pub const REQUEST__CqueryCallers: &str = "$cquery/callers";
-pub const REQUEST__CqueryDerived: &str = "$cquery/derived";
-pub const REQUEST__CqueryVars: &str = "$cquery/vars";
 pub const NOTIFICATION__LanguageStatus: &str = "language/status";
 pub const REQUEST__ClassFileContents: &str = "java/classFileContents";
 
@@ -107,6 +107,7 @@ pub struct State {
     pub highlights_placed: HashMap<String, Vec<Highlight>>,
     // TODO: make file specific.
     pub highlight_match_ids: Vec<u32>,
+    pub document_highlight_source: Option<u64>,
     pub user_handlers: HashMap<String, String>,
     #[serde(skip_serializing)]
     pub watchers: HashMap<String, notify::RecommendedWatcher>,
@@ -127,6 +128,7 @@ pub struct State {
     pub diagnosticsList: DiagnosticsList,
     pub diagnosticsDisplay: HashMap<u64, DiagnosticsDisplay>,
     pub diagnosticsSignsMax: Option<u64>,
+    pub documentHighlightDisplay: HashMap<u64, DocumentHighlightDisplay>,
     pub windowLogMessageLevel: MessageType,
     pub settingsPath: String,
     pub loadSettings: bool,
@@ -171,6 +173,7 @@ impl State {
             highlights: HashMap::new(),
             highlights_placed: HashMap::new(),
             highlight_match_ids: Vec::new(),
+            document_highlight_source: None,
             user_handlers: HashMap::new(),
             watchers: HashMap::new(),
             watcher_rxs: HashMap::new(),
@@ -188,6 +191,7 @@ impl State {
             diagnosticsList: DiagnosticsList::Quickfix,
             diagnosticsDisplay: DiagnosticsDisplay::default(),
             diagnosticsSignsMax: None,
+            documentHighlightDisplay: DocumentHighlightDisplay::default(),
             windowLogMessageLevel: MessageType::Warning,
             settingsPath: format!(".vim{}settings.json", std::path::MAIN_SEPARATOR),
             loadSettings: false,
@@ -362,6 +366,40 @@ impl Sign {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentHighlightDisplay {
+    pub name: String,
+    pub texthl: String,
+}
+
+impl DocumentHighlightDisplay {
+    pub fn default() -> HashMap<u64, DocumentHighlightDisplay> {
+        let mut map = HashMap::new();
+        map.insert(
+            1,
+            DocumentHighlightDisplay {
+                name: "Text".to_owned(),
+                texthl: "SpellCap".to_owned(),
+            },
+        );
+        map.insert(
+            2,
+            DocumentHighlightDisplay {
+                name: "Read".to_owned(),
+                texthl: "SpellLocal".to_owned(),
+            },
+        );
+        map.insert(
+            3,
+            DocumentHighlightDisplay {
+                name: "Write".to_owned(),
+                texthl: "SpellRare".to_owned(),
+            },
+        );
+        map
+    }
+}
+
 impl std::cmp::Ord for Sign {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.id.cmp(&other.id)
@@ -498,13 +536,36 @@ pub struct VimCompleteItemUserData {
     pub lspitem: Option<CompletionItem>,
 }
 
-impl FromLSP<CompletionItem> for VimCompleteItem {
-    fn from_lsp(lspitem: &CompletionItem) -> Result<VimCompleteItem> {
+impl VimCompleteItem {
+    pub fn from_lsp(
+        lspitem: &CompletionItem,
+        complete_position: Option<u64>,
+    ) -> Result<VimCompleteItem> {
         let abbr = lspitem.label.clone();
-        let word = lspitem
-            .insert_text
-            .clone()
-            .unwrap_or_else(|| lspitem.label.clone());
+        let mut word = lspitem.insert_text.clone().unwrap_or_default();
+        if word.is_empty() {
+            match (lspitem.text_edit.clone(), complete_position) {
+                (Some(text_edit), Some(complete_position)) => {
+                    // TextEdit range start might be different from vim expected completion start.
+                    // From spec, TextEdit can only span one line, i.e., the current line.
+                    if text_edit.range.start.line != complete_position {
+                        word = text_edit
+                            .new_text
+                            .get((complete_position as usize)..)
+                            .and_then(|line| line.split_whitespace().next())
+                            .map_or_else(String::new, ToOwned::to_owned);
+                    } else {
+                        word = text_edit.new_text.clone();
+                    }
+                }
+                (Some(text_edit), _) => {
+                    word = text_edit.new_text.clone();
+                }
+                (_, _) => {
+                    word = lspitem.label.clone();
+                }
+            }
+        }
 
         let is_snippet;
         let snippet;
@@ -737,6 +798,12 @@ impl ToInt for DiagnosticSeverity {
 }
 
 impl ToInt for MessageType {
+    fn to_int(&self) -> Result<u64> {
+        Ok(*self as u64)
+    }
+}
+
+impl ToInt for DocumentHighlightKind {
     fn to_int(&self) -> Result<u64> {
         Ok(*self as u64)
     }

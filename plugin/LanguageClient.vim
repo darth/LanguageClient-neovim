@@ -42,6 +42,10 @@ function! LanguageClient_textDocument_rangeFormatting(...)
     return call('LanguageClient#textDocument_rangeFormatting', a:000)
 endfunction
 
+function! LanguageClient_textDocument_documentHighlight(...)
+    return call('LanguageClient#textDocument_documentHighlight', a:000)
+endfunction
+
 function! LanguageClient_workspace_symbol(...)
     return call('LanguageClient#workspace_symbol', a:000)
 endfunction
@@ -86,12 +90,12 @@ function! LanguageClient_statusLine(...)
     return call('LanguageClient#statusLine', a:000)
 endfunction
 
-function! LanguageClient_cquery_base(...)
-    return call('LanguageClient#cquery_base', a:000)
+function! LanguageClient_clearDocumentHighlight(...)
+    return call('LanguageClient#clearDocumentHighlight', a:000)
 endfunction
 
-function! LanguageClient_cquery_derived(...)
-    return call('LanguageClient#cquery_derived', a:000)
+function! LanguageClient_cquery_base(...)
+    return call('LanguageClient#cquery_base', a:000)
 endfunction
 
 function! LanguageClient_cquery_vars(...)
@@ -110,6 +114,9 @@ augroup languageClient
     autocmd BufDelete * call LanguageClient#handleBufDelete()
     autocmd TextChanged * call LanguageClient#handleTextChanged()
     autocmd TextChangedI * call LanguageClient#handleTextChanged()
+    if exists('##TextChangedP')
+        autocmd TextChangedP * call LanguageClient#handleTextChanged()
+    endif
     autocmd CursorMoved * call LanguageClient#handleCursorMoved()
     autocmd BufEnter * call LanguageClient#handleBufEnter()
     autocmd BufLeave * call LanguageClient#handleBufLeave()
