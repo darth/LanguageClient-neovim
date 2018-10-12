@@ -21,7 +21,7 @@ going to be used to start language server. See |LanguageClient_serverCommands|
 for detail. Here is a simple example config: >
 
     let g:LanguageClient_serverCommands = {
-        \ 'rust': ['rustup', 'run', 'nightly', 'rls'],
+        \ 'rust': ['rustup', 'run', 'stable', 'rls'],
         \ }
 
 After that, open a file with one of the above filetypes, functionalities
@@ -34,6 +34,19 @@ like to map these functions to shortcuts, for example: >
     nnoremap <silent> K :call LanguageClient#textDocument_hover()<CR>
     nnoremap <silent> gd :call LanguageClient#textDocument_definition()<CR>
     nnoremap <silent> <F2> :call LanguageClient#textDocument_rename()<CR>
+
+You can apply these mappings only for buffers with supported filetypes with a
+simple function: >
+
+    function LC_maps()
+      if has_key(g:LanguageClient_serverCommands, &filetype)
+        nnoremap <buffer> <silent> K :call LanguageClient#textDocument_hover()<cr>
+        nnoremap <buffer> <silent> gd :call LanguageClient#textDocument_definition()<CR>
+        nnoremap <buffer> <silent> <F2> :call LanguageClient#textDocument_rename()<CR>
+      endif
+    endfunction
+
+    autocmd FileType * call LC_maps()
 
 If one is using deoplete/nvim-completion-manager at the same time, completion
 should work out of the box. Otherwise, completion is available with 'C-X C-O'
@@ -60,10 +73,10 @@ String to list map. Defines commands to start language server for specific
 filetype. For example: >
 
     let g:LanguageClient_serverCommands = {
-        \ 'rust': ['rustup', 'run', 'nightly', 'rls'],
+        \ 'rust': ['rustup', 'run', 'stable', 'rls'],
         \ }
 
-In the example above, 'run', 'nightly', and 'rls' are arguments to the
+In the example above, 'run', 'stable', and 'rls' are arguments to the
 'rustup' command line tool.
 
 Or tcp connection string to the server, >
@@ -619,14 +632,16 @@ Please report all bugs at https://github.com/autozimu/LanguageClient-neovim/issu
 
 If you believe you've find a bug in this plugin, please first try to help
 narrow down where the error happens, which will reduce bug fix time/effort
-tremendously.
+significantly.
+
+Experiment with VS Code plugin if the language server has one.
 
 Try increasing logging level to 'INFO' or 'DEBUG' using the
 |LanguageClient_setLoggingLevel| function, and check the log file.
 
 There is also an utility script in: >
 
-    $RUNTIME/rplugin/python3/LanguageClient/wrapper.sh
+    $RUNTIME/tests/wrapper-server.sh
 
 which can work like a proxy and logs all stdin and stdout of the language
 server into a log file.

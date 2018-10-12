@@ -1010,6 +1010,9 @@ endfunction
 let g:LanguageClient_completeResults = []
 function! LanguageClient#complete(findstart, base) abort
     if a:findstart
+        " Before requesting completion, content between l:start and current cursor is removed.
+        let s:completeText = LSP#text()
+
         let l:input = getline('.')[:LSP#character() - 1]
         let l:start = LanguageClient#get_complete_start(l:input)
         return l:start
@@ -1019,6 +1022,7 @@ function! LanguageClient#complete(findstart, base) abort
                     \ 'LanguageClient#omniComplete', {
                     \ 'character': LSP#character() + len(a:base),
                     \ 'complete_position': LSP#character(),
+                    \ 'text': s:completeText,
                     \ })
         let l:result = l:result is v:null ? [] : l:result
         let l:filtered_items = []
