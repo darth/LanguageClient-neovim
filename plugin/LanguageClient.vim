@@ -1,3 +1,7 @@
+if !exists('g:LanguageClient_serverCommands')
+    let g:LanguageClient_serverCommands = {}
+endif
+
 function! LanguageClient_textDocument_hover(...)
     return call('LanguageClient#textDocument_hover', a:000)
 endfunction
@@ -108,8 +112,8 @@ command! LanguageClientToggle :call LanguageClient#toggle()
 
 augroup languageClient
     autocmd!
+    autocmd FileType * call LanguageClient#handleFileType()
     autocmd BufNewFile * call LanguageClient#handleBufNewFile()
-    autocmd BufReadPost * call LanguageClient#handleBufReadPost()
     autocmd BufWritePost * call LanguageClient#handleBufWritePost()
     autocmd BufDelete * call LanguageClient#handleBufDelete()
     autocmd TextChanged * call LanguageClient#handleTextChanged()

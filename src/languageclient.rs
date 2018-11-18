@@ -1,6 +1,7 @@
 use super::*;
-use lsp::notification::Notification;
-use lsp::request::Request;
+use crate::lsp::notification::Notification;
+use crate::lsp::request::GotoDefinitionResponse;
+use crate::lsp::request::Request;
 
 impl State {
     /////// Utils ///////
@@ -257,8 +258,20 @@ impl State {
             self.gather_args(&[VimVar::Filename, VimVar::Line, VimVar::Character], params)?;
 
         if let Some(ref changes) = edit.document_changes {
-            for e in changes {
-                self.apply_TextEdits(&e.text_document.uri.filepath()?, &e.edits)?;
+            match changes {
+                DocumentChanges::Edits(ref changes) => {
+                    for e in changes {
+                        self.apply_TextEdits(&e.text_document.uri.filepath()?, &e.edits)?;
+                    }
+                }
+                DocumentChanges::Operations(ref ops) => {
+                    for op in ops {
+                        if let DocumentChangeOperation::Edit(ref e) = op {
+                            self.apply_TextEdits(&e.text_document.uri.filepath()?, &e.edits)?;
+                        }
+                        // TODO: handle ResourceOp.
+                    }
+                }
             }
         }
         if let Some(ref changes) = edit.changes {
@@ -331,20 +344,40 @@ impl State {
                     })
                 }).collect::<Result<Vec<_>>>()?;
 
-            let HighlightSource { buffer, source } =
-                if let Some(highlight_source) = self.document_highlight_source {
-                    highlight_source
+            let buffer = self.call(None, "nvim_win_get_buf", json!([0]))?;
+
+            let source = if let Some(hs) = self.document_highlight_source {
+                if hs.buffer == buffer {
+                    // If we want to highlight in the same buffer as last time, we can reuse
+                    // the previous source.
+                    Some(hs.source)
                 } else {
-                    let buffer = self.call(None, "nvim_win_get_buf", json!([0]))?;
+                    // Clear the highlight in the previous buffer.
+                    self.notify(
+                        None,
+                        "nvim_buf_clear_highlight",
+                        json!([hs.buffer, hs.source, 0, -1]),
+                    )?;
+
+                    None
+                }
+            } else {
+                None
+            };
+
+            let source = match source {
+                Some(source) => source,
+                None => {
+                    // Create a new source.
                     let source = self.call(
                         None,
                         "nvim_buf_add_highlight",
                         json!([buffer, 0, "Error", 1, 1, 1]),
                     )?;
-                    let highlight_source = HighlightSource { buffer, source };
-                    self.document_highlight_source = Some(highlight_source);
-                    highlight_source
-                };
+                    self.document_highlight_source = Some(HighlightSource { buffer, source });
+                    source
+                }
+            };
 
             self.notify(
                 None,
@@ -590,7 +623,7 @@ impl State {
         Ok(())
     }
 
-    fn display_locations(&mut self, locations: &[Location]) -> Result<()> {
+    fn display_locations(&mut self, locations: &[Location], title: &str) -> Result<()> {
         let location_to_quickfix_entry =
             |state: &mut Self, loc: &Location| -> Result<QuickfixEntry> {
                 let filename = loc.uri.filepath()?.to_string_lossy().into_owned();
@@ -639,7 +672,7 @@ impl State {
                     .map(|loc| location_to_quickfix_entry(self, loc))
                     .collect();
                 let list = list?;
-                self.setqflist(&list)?;
+                self.setqflist(&list, " ", title)?;
                 self.echo("Quickfix list updated.")?;
             }
             SelectionUI::LocationList => {
@@ -648,7 +681,7 @@ impl State {
                     .map(|loc| location_to_quickfix_entry(self, loc))
                     .collect();
                 let list = list?;
-                self.setloclist(&list)?;
+                self.setloclist(&list, " ", title)?;
                 self.echo("Location list updated.")?;
             }
         }
@@ -909,13 +942,13 @@ impl State {
                         apply_edit: Some(true),
                         did_change_watched_files: Some(GenericCapability {
                             dynamic_registration: Some(true),
-                            hierarchical_document_symbol_support: None,
                         }),
                         ..WorkspaceClientCapabilities::default()
                     }),
                     ..ClientCapabilities::default()
                 },
                 trace,
+                workspace_folders: None,
             },
         )?;
 
@@ -1012,7 +1045,8 @@ impl State {
         self.textDocument_didChange(params)?;
         let (method,): (String,) = self.gather_args(&["method"], params)?;
         info!("Begin {}", method);
-        let (languageId, filename, line, character, handle, goto_cmd): (
+        let (languageId, filename, word, line, character, handle, goto_cmd): (
+            String,
             String,
             String,
             u64,
@@ -1023,6 +1057,7 @@ impl State {
             &[
                 VimVar::LanguageId,
                 VimVar::Filename,
+                VimVar::Cword,
                 VimVar::Line,
                 VimVar::Character,
                 VimVar::Handle,
@@ -1069,7 +1104,10 @@ impl State {
                         loc.range.start.character + 1
                     ))?;
                 }
-                _ => self.display_locations(&arr)?,
+                _ => {
+                    let title = format!("[LC]: search for {}", word);
+                    self.display_locations(&arr, &title)?
+                }
             },
         };
 
@@ -1080,8 +1118,7 @@ impl State {
     pub fn textDocument_rename(&mut self, params: &Value) -> Result<Value> {
         self.textDocument_didChange(params)?;
         info!("Begin {}", lsp::request::Rename::METHOD);
-        let (buftype, languageId, filename, line, character, cword, new_name, handle): (
-            String,
+        let (languageId, filename, line, character, cword, new_name, handle): (
             String,
             String,
             u64,
@@ -1091,7 +1128,6 @@ impl State {
             bool,
         ) = self.gather_args(
             &[
-                VimVar::Buftype,
                 VimVar::LanguageId,
                 VimVar::Filename,
                 VimVar::Line,
@@ -1102,9 +1138,6 @@ impl State {
             ],
             params,
         )?;
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(Value::Null);
-        }
 
         let mut new_name = new_name.unwrap_or_default();
         if new_name.is_empty() {
@@ -1142,20 +1175,10 @@ impl State {
         self.textDocument_didChange(params)?;
         info!("Begin {}", lsp::request::DocumentSymbolRequest::METHOD);
 
-        let (buftype, languageId, filename, handle): (String, String, String, bool) = self
-            .gather_args(
-                &[
-                    VimVar::Buftype,
-                    VimVar::LanguageId,
-                    VimVar::Filename,
-                    VimVar::Handle,
-                ],
-                params,
-            )?;
-
-        if !buftype.is_empty() {
-            return Ok(Value::Null);
-        }
+        let (languageId, filename, handle): (String, String, bool) = self.gather_args(
+            &[VimVar::LanguageId, VimVar::Filename, VimVar::Handle],
+            params,
+        )?;
 
         let result = self.call(
             Some(&languageId),
@@ -1172,6 +1195,7 @@ impl State {
         }
 
         let symbols: Vec<SymbolInformation> = serde_json::from_value(result.clone())?;
+        let title = format!("[LC]: symbols for {}", filename);
 
         match self.get(|state| Ok(state.selectionUI.clone()))? {
             SelectionUI::FZF => {
@@ -1197,13 +1221,13 @@ impl State {
             SelectionUI::Quickfix => {
                 let list: Result<Vec<_>> = symbols.iter().map(QuickfixEntry::from_lsp).collect();
                 let list = list?;
-                self.setqflist(&list)?;
+                self.setqflist(&list, " ", &title)?;
                 self.echo("Document symbols populated to quickfix list.")?;
             }
             SelectionUI::LocationList => {
                 let list: Result<Vec<_>> = symbols.iter().map(QuickfixEntry::from_lsp).collect();
                 let list = list?;
-                self.setloclist(&list)?;
+                self.setloclist(&list, " ", &title)?;
                 self.echo("Document symbols populated to location list.")?;
             }
         }
@@ -1215,8 +1239,7 @@ impl State {
     pub fn textDocument_codeAction(&mut self, params: &Value) -> Result<Value> {
         self.textDocument_didChange(params)?;
         info!("Begin {}", lsp::request::CodeActionRequest::METHOD);
-        let (buftype, languageId, filename, line, character, handle): (
-            String,
+        let (languageId, filename, line, character, handle): (
             String,
             String,
             u64,
@@ -1224,7 +1247,6 @@ impl State {
             bool,
         ) = self.gather_args(
             &[
-                VimVar::Buftype,
                 VimVar::LanguageId,
                 VimVar::Filename,
                 VimVar::Line,
@@ -1233,9 +1255,6 @@ impl State {
             ],
             params,
         )?;
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(Value::Null);
-        }
 
         // Unify filename.
         let filename = filename.canonicalize();
@@ -1263,7 +1282,10 @@ impl State {
                     start: Position { line, character },
                     end: Position { line, character },
                 },
-                context: CodeActionContext { diagnostics },
+                context: CodeActionContext {
+                    diagnostics,
+                    only: None,
+                },
             },
         )?;
 
@@ -1293,8 +1315,7 @@ impl State {
         self.textDocument_didChange(params)?;
         info!("Begin {}", lsp::request::Completion::METHOD);
 
-        let (buftype, languageId, filename, line, character, handle): (
-            String,
+        let (languageId, filename, line, character, handle): (
             String,
             String,
             u64,
@@ -1302,7 +1323,6 @@ impl State {
             bool,
         ) = self.gather_args(
             &[
-                VimVar::Buftype,
                 VimVar::LanguageId,
                 VimVar::Filename,
                 VimVar::Line,
@@ -1311,9 +1331,6 @@ impl State {
             ],
             params,
         )?;
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(Value::Null);
-        }
 
         let result = self.call(
             Some(&languageId),
@@ -1337,8 +1354,7 @@ impl State {
     pub fn textDocument_signatureHelp(&mut self, params: &Value) -> Result<Value> {
         self.textDocument_didChange(params)?;
         info!("Begin {}", lsp::request::SignatureHelpRequest::METHOD);
-        let (buftype, languageId, filename, line, character, handle): (
-            String,
+        let (languageId, filename, line, character, handle): (
             String,
             String,
             u64,
@@ -1346,7 +1362,6 @@ impl State {
             bool,
         ) = self.gather_args(
             &[
-                VimVar::Buftype,
                 VimVar::LanguageId,
                 VimVar::Filename,
                 VimVar::Line,
@@ -1355,9 +1370,6 @@ impl State {
             ],
             params,
         )?;
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(Value::Null);
-        }
 
         let result = self.call(
             Some(&languageId),
@@ -1418,11 +1430,8 @@ impl State {
     pub fn textDocument_references(&mut self, params: &Value) -> Result<Value> {
         info!("Begin {}", lsp::request::References::METHOD);
 
-        let (buftype, include_declaration): (String, bool) =
-            self.gather_args(&[VimVar::Buftype, VimVar::IncludeDeclaration], params)?;
-        if !buftype.is_empty() {
-            return Ok(Value::Null);
-        }
+        let (include_declaration,): (bool,) =
+            self.gather_args(&[VimVar::IncludeDeclaration], params)?;
 
         let params = json!({
                 "method": lsp::request::References::METHOD,
@@ -1440,19 +1449,10 @@ impl State {
     pub fn textDocument_formatting(&mut self, params: &Value) -> Result<Value> {
         self.textDocument_didChange(params)?;
         info!("Begin {}", lsp::request::Formatting::METHOD);
-        let (buftype, languageId, filename, handle): (String, String, String, bool) = self
-            .gather_args(
-                &[
-                    VimVar::Buftype,
-                    VimVar::LanguageId,
-                    VimVar::Filename,
-                    VimVar::Handle,
-                ],
-                params,
-            )?;
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(Value::Null);
-        }
+        let (languageId, filename, handle): (String, String, bool) = self.gather_args(
+            &[VimVar::LanguageId, VimVar::Filename, VimVar::Handle],
+            params,
+        )?;
 
         let (tab_size, insert_spaces): (u64, u64) =
             self.eval(["shiftwidth()", "&expandtab"].as_ref())?;
@@ -1490,8 +1490,7 @@ impl State {
     pub fn textDocument_rangeFormatting(&mut self, params: &Value) -> Result<Value> {
         self.textDocument_didChange(params)?;
         info!("Begin {}", lsp::request::RangeFormatting::METHOD);
-        let (buftype, languageId, filename, handle, start_line, end_line): (
-            String,
+        let (languageId, filename, handle, start_line, end_line): (
             String,
             String,
             bool,
@@ -1499,7 +1498,6 @@ impl State {
             u64,
         ) = self.gather_args(
             &[
-                VimVar::Buftype.to_key().as_str(),
                 VimVar::LanguageId.to_key().as_str(),
                 VimVar::Filename.to_key().as_str(),
                 VimVar::Handle.to_key().as_str(),
@@ -1508,9 +1506,6 @@ impl State {
             ],
             params,
         )?;
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(Value::Null);
-        }
 
         let (tab_size, insert_spaces): (u64, u64) =
             self.eval(["shiftwidth()", "&expandtab"].as_ref())?;
@@ -1558,13 +1553,8 @@ impl State {
     pub fn completionItem_resolve(&mut self, params: &Value) -> Result<Value> {
         self.textDocument_didChange(params)?;
         info!("Begin {}", lsp::request::ResolveCompletionItem::METHOD);
-        let (buftype, languageId, handle): (String, String, bool) = self.gather_args(
-            &[VimVar::Buftype, VimVar::LanguageId, VimVar::Handle],
-            params,
-        )?;
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(Value::Null);
-        }
+        let (languageId, handle): (String, bool) =
+            self.gather_args(&[VimVar::LanguageId, VimVar::Handle], params)?;
         let (completion_item,): (CompletionItem,) =
             self.gather_args(&["completionItem"], params)?;
 
@@ -1590,13 +1580,8 @@ impl State {
     pub fn workspace_symbol(&mut self, params: &Value) -> Result<Value> {
         self.textDocument_didChange(params)?;
         info!("Begin {}", lsp::request::WorkspaceSymbol::METHOD);
-        let (buftype, languageId, handle): (String, String, bool) = self.gather_args(
-            &[VimVar::Buftype, VimVar::LanguageId, VimVar::Handle],
-            params,
-        )?;
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(Value::Null);
-        }
+        let (languageId, handle): (String, bool) =
+            self.gather_args(&[VimVar::LanguageId, VimVar::Handle], params)?;
 
         let (query,): (String,) = self.gather_args(&[("query", "")], params)?;
         let result = self.call(
@@ -1610,6 +1595,7 @@ impl State {
         }
 
         let symbols: Vec<SymbolInformation> = serde_json::from_value(result.clone())?;
+        let title = "[LC]: workspace symbols";
 
         match self.get(|state| Ok(state.selectionUI.clone()))? {
             SelectionUI::FZF => {
@@ -1640,13 +1626,13 @@ impl State {
             SelectionUI::Quickfix => {
                 let list: Result<Vec<_>> = symbols.iter().map(QuickfixEntry::from_lsp).collect();
                 let list = list?;
-                self.setqflist(&list)?;
+                self.setqflist(&list, " ", title)?;
                 self.echo("Workspace symbols populated to quickfix list.")?;
             }
             SelectionUI::LocationList => {
                 let list: Result<Vec<_>> = symbols.iter().map(QuickfixEntry::from_lsp).collect();
                 let list = list?;
-                self.setloclist(&list)?;
+                self.setloclist(&list, " ", title)?;
                 self.echo("Workspace symbols populated to location list.")?;
             }
         }
@@ -1702,20 +1688,10 @@ impl State {
 
     pub fn textDocument_didOpen(&mut self, params: &Value) -> Result<()> {
         info!("Begin {}", lsp::notification::DidOpenTextDocument::METHOD);
-        let (buftype, languageId, filename, text): (String, String, String, Vec<String>) = self
-            .gather_args(
-                &[
-                    VimVar::Buftype,
-                    VimVar::LanguageId,
-                    VimVar::Filename,
-                    VimVar::Text,
-                ],
-                params,
-            )?;
-
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(());
-        }
+        let (languageId, filename, text): (String, String, Vec<String>) = self.gather_args(
+            &[VimVar::LanguageId, VimVar::Filename, VimVar::Text],
+            params,
+        )?;
 
         let text_document = TextDocumentItem {
             uri: filename.to_url()?,
@@ -1743,7 +1719,11 @@ impl State {
             "setbufvar",
             json!([filename, "LanguageClient_projectRoot", root]),
         )?;
-        self.notify(None, "s:ExecuteAutocmd", "LanguageClientBufReadPost")?;
+        self.notify(
+            None,
+            "s:ExecuteAutocmd",
+            "LanguageClientTextDocumentDidOpenPost",
+        )?;
 
         info!("End {}", lsp::notification::DidOpenTextDocument::METHOD);
         Ok(())
@@ -1751,13 +1731,8 @@ impl State {
 
     pub fn textDocument_didChange(&mut self, params: &Value) -> Result<()> {
         info!("Begin {}", lsp::notification::DidChangeTextDocument::METHOD);
-        let (buftype, languageId, filename): (String, String, String) = self.gather_args(
-            &[VimVar::Buftype, VimVar::LanguageId, VimVar::Filename],
-            params,
-        )?;
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(());
-        }
+        let (languageId, filename): (String, String) =
+            self.gather_args(&[VimVar::LanguageId, VimVar::Filename], params)?;
         if !self.get(|state| Ok(state.text_documents.contains_key(&filename)))? {
             info!("Not opened yet. Switching to didOpen.");
             return self.textDocument_didOpen(params);
@@ -1821,13 +1796,12 @@ impl State {
 
     pub fn textDocument_didSave(&mut self, params: &Value) -> Result<()> {
         info!("Begin {}", lsp::notification::DidSaveTextDocument::METHOD);
-        let (buftype, languageId, filename): (String, String, String) = self.gather_args(
-            &[VimVar::Buftype, VimVar::LanguageId, VimVar::Filename],
-            params,
-        )?;
-        if !buftype.is_empty() || languageId.is_empty() {
+        let (languageId, filename): (String, String) =
+            self.gather_args(&[VimVar::LanguageId, VimVar::Filename], params)?;
+        if !self.serverCommands.contains_key(&languageId) {
             return Ok(());
         }
+
         let uri = filename.to_url()?;
 
         self.notify(
@@ -1844,13 +1818,8 @@ impl State {
 
     pub fn textDocument_didClose(&mut self, params: &Value) -> Result<()> {
         info!("Begin {}", lsp::notification::DidCloseTextDocument::METHOD);
-        let (buftype, languageId, filename): (String, String, String) = self.gather_args(
-            &[VimVar::Buftype, VimVar::LanguageId, VimVar::Filename],
-            params,
-        )?;
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(());
-        }
+        let (languageId, filename): (String, String) =
+            self.gather_args(&[VimVar::LanguageId, VimVar::Filename], params)?;
 
         self.notify(
             Some(&languageId),
@@ -2112,11 +2081,8 @@ impl State {
 
     pub fn languageClient_handleBufNewFile(&mut self, params: &Value) -> Result<()> {
         info!("Begin {}", NOTIFICATION__HandleBufNewFile);
-        let (buftype, languageId, filename): (String, String, String) = self.gather_args(
-            &[VimVar::Buftype, VimVar::LanguageId, VimVar::Filename],
-            params,
-        )?;
-        if !buftype.is_empty() || languageId.is_empty() || filename.is_empty() {
+        let (filename,): (String,) = self.gather_args(&[VimVar::Filename], params)?;
+        if filename.is_empty() {
             return Ok(());
         }
         let autoStart: u8 = self.eval("!!get(g:, 'LanguageClient_autoStart', 1)")?;
@@ -2132,25 +2098,17 @@ impl State {
         Ok(())
     }
 
-    pub fn languageClient_handleBufReadPost(&mut self, params: &Value) -> Result<()> {
-        info!("Begin {}", NOTIFICATION__HandleBufReadPost);
-        let (buftype, languageId, filename): (String, String, String) = self.gather_args(
-            &[VimVar::Buftype, VimVar::LanguageId, VimVar::Filename],
-            params,
-        )?;
-        if !buftype.is_empty() || languageId.is_empty() || filename.is_empty() {
-            return Ok(());
-        }
-
-        // File opened before.
-        if self.get(|state| Ok(state.text_documents.contains_key(&filename)))? {
-            info!("File is opened before.");
+    pub fn languageClient_handleFileType(&mut self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION__HandleFileType);
+        let (languageId, filename): (String, String) =
+            self.gather_args(&[VimVar::LanguageId, VimVar::Filename], params)?;
+        if filename.is_empty() {
             return Ok(());
         }
 
         let filename = filename.canonicalize();
 
-        if self.get(|state| Ok(state.writers.contains_key(&languageId)))? {
+        if self.writers.contains_key(&languageId) {
             self.textDocument_didOpen(params)?;
 
             if let Some(diagnostics) = self.diagnostics.get(&filename).cloned() {
@@ -2168,20 +2126,18 @@ impl State {
             }
         }
 
-        info!("End {}", NOTIFICATION__HandleBufReadPost);
+        info!("End {}", NOTIFICATION__HandleFileType);
         Ok(())
     }
 
     pub fn languageClient_handleTextChanged(&mut self, params: &Value) -> Result<()> {
         info!("Begin {}", NOTIFICATION__HandleTextChanged);
-        let (buftype, filename): (String, String) =
-            self.gather_args(&[VimVar::Buftype, VimVar::Filename], params)?;
-        if !buftype.is_empty() {
-            info!(
-                "Skip handleTextChanged as buftype is non-empty: {}",
-                buftype
-            );
+        let (languageId, filename): (String, String) =
+            self.gather_args(&[VimVar::LanguageId, VimVar::Filename], params)?;
+        if !self.serverCommands.contains_key(&languageId) {
+            return Ok(());
         }
+
         let skip_notification = self.get(|state| {
             if let Some(metadata) = state.text_documents_metadata.get(&filename) {
                 if let Some(throttle) = state.change_throttle {
@@ -2211,7 +2167,12 @@ impl State {
 
     pub fn languageClient_handleBufDelete(&mut self, params: &Value) -> Result<()> {
         info!("Begin {}", NOTIFICATION__HandleBufWritePost);
-        let (filename,): (String,) = self.gather_args(&[VimVar::Filename], params)?;
+        let (languageId, filename): (String, String) =
+            self.gather_args(&[VimVar::LanguageId, VimVar::Filename], params)?;
+        if !self.serverCommands.contains_key(&languageId) {
+            return Ok(());
+        }
+
         self.update(|state| {
             state.text_documents.retain(|f, _| f != &filename);
             state.diagnostics.retain(|f, _| f != &filename);
@@ -2226,13 +2187,19 @@ impl State {
 
     pub fn languageClient_handleCursorMoved(&mut self, params: &Value) -> Result<()> {
         info!("Begin {}", NOTIFICATION__HandleCursorMoved);
-        let (buftype, filename, line): (String, String, u64) =
-            self.gather_args(&[VimVar::Buftype, VimVar::Filename, VimVar::Line], params)?;
+        let (languageId, filename, line): (String, String, u64) = self.gather_args(
+            &[VimVar::LanguageId, VimVar::Filename, VimVar::Line],
+            params,
+        )?;
+        if !self.serverCommands.contains_key(&languageId) {
+            return Ok(());
+        }
+
         let (visible_line_start, visible_line_end): (u64, u64) = self.gather_args(
             &["LSP#visible_line_start()", "LSP#visible_line_end()"],
             params,
         )?;
-        if !buftype.is_empty() && !self.diagnostics.contains_key(&filename) {
+        if !self.diagnostics.contains_key(&filename) {
             return Ok(());
         }
 
@@ -2467,7 +2434,6 @@ impl State {
         let character = ctx.col - 1;
 
         let result = self.textDocument_completion(&json!({
-                "buftype": "",
                 "languageId": ctx.filetype,
                 "filename": filename,
                 "line": line,
@@ -2512,7 +2478,6 @@ impl State {
         let character = ctx.ccol - 1;
 
         let result = self.textDocument_completion(&json!({
-                "buftype": "",
                 "languageId": ctx.filetype,
                 "filename": filename,
                 "line": line,
@@ -2548,18 +2513,8 @@ impl State {
 
     pub fn languageClient_explainErrorAtPoint(&mut self, params: &Value) -> Result<Value> {
         info!("Begin {}", REQUEST__ExplainErrorAtPoint);
-        let (buftype, filename, line, character): (String, String, u64, u64) = self.gather_args(
-            &[
-                VimVar::Buftype,
-                VimVar::Filename,
-                VimVar::Line,
-                VimVar::Character,
-            ],
-            params,
-        )?;
-        if !buftype.is_empty() {
-            return Ok(Value::Null);
-        }
+        let (filename, line, character): (String, u64, u64) =
+            self.gather_args(&[VimVar::Filename, VimVar::Line, VimVar::Character], params)?;
         let diag = self.get(|state| {
             state
                 .diagnostics
@@ -2594,52 +2549,6 @@ impl State {
         self.echomsg(&msg)?;
         info!("End {}", NOTIFICATION__LanguageStatus);
         Ok(())
-    }
-
-    pub fn rustDocument_implementations(&mut self, params: &Value) -> Result<Value> {
-        info!("Begin {}", REQUEST__RustImplementations);
-        let (buftype, languageId, filename, line, character, handle): (
-            String,
-            String,
-            String,
-            u64,
-            u64,
-            bool,
-        ) = self.gather_args(
-            &[
-                VimVar::Buftype,
-                VimVar::LanguageId,
-                VimVar::Filename,
-                VimVar::Line,
-                VimVar::Character,
-                VimVar::Handle,
-            ],
-            params,
-        )?;
-        if !buftype.is_empty() || languageId.is_empty() {
-            return Ok(Value::Null);
-        }
-
-        let result = self.call(
-            Some(&languageId),
-            REQUEST__RustImplementations,
-            TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: filename.to_url()?,
-                },
-                position: Position { line, character },
-            },
-        )?;
-
-        if !handle {
-            return Ok(result);
-        }
-
-        let locations: Vec<Location> = serde_json::from_value(result.clone())?;
-        self.display_locations(&locations)?;
-
-        info!("End {}", REQUEST__RustImplementations);
-        Ok(result)
     }
 
     pub fn rust_handleBeginBuild(&mut self, _params: &Value) -> Result<()> {
@@ -2717,14 +2626,7 @@ impl State {
         let (cmdargs,): (Vec<String>,) = self.gather_args(&[("cmdargs", "[]")], params)?;
         let cmdparams = vim_cmd_args_to_value(&cmdargs)?;
         let params = params.combine(&cmdparams);
-        let (buftype, languageId, filename): (String, String, String) = self.gather_args(
-            &[VimVar::Buftype, VimVar::LanguageId, VimVar::Filename],
-            &params,
-        )?;
-
-        if !buftype.is_empty() || filename.is_empty() {
-            return Ok(Value::Null);
-        }
+        let (languageId,): (String,) = self.gather_args(&[VimVar::LanguageId], &params)?;
 
         if self.get(|state| Ok(state.writers.contains_key(&languageId)))? {
             bail!(
@@ -2759,14 +2661,13 @@ impl State {
                 let writer = Box::new(BufWriter::new(stream));
                 (None, reader, writer)
             } else {
-                let home = env::home_dir().ok_or_else(|| err_msg("Failed to get home dir"))?;
                 let command: Vec<_> = command
                     .into_iter()
-                    .map(|cmd| {
-                        if cmd.starts_with('~') {
-                            cmd.replacen('~', &home.to_string_lossy(), 1)
-                        } else {
-                            cmd
+                    .map(|cmd| match shellexpand::full(&cmd) {
+                        Ok(cmd) => cmd.as_ref().into(),
+                        Err(err) => {
+                            warn!("Error expanding ({}): {}", cmd, err);
+                            cmd.clone()
                         }
                     }).collect();
 
@@ -2829,7 +2730,7 @@ impl State {
                                 "languageId": languageId_clone,
                                 "message": format!("{}", err),
                             }).to_params()
-                            .unwrap_or_default(),
+                            .unwrap_or(Params::None),
                         },
                     ));
                 }

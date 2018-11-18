@@ -196,12 +196,13 @@ function! s:FZF(source, sink) abort
         return
     endif
 
-    if exists('LanguageClient_fzfOptions')
-        let l:options = LanguageClient_fzfOptions
-    elseif exists('*fzf#vim#with_preview')
-        let l:options = fzf#vim#with_preview('right:50%:hidden', '?').options
-    else
-        let l:options = []
+    let l:options = s:GetVar('LanguageClient_fzfOptions')
+    if l:options is v:null
+        if exists('*fzf#vim#with_preview')
+            let l:options = fzf#vim#with_preview('right:50%:hidden', '?').options
+        else
+            let l:options = []
+        endif
     endif
     if a:sink ==# 's:LanguageClient_FZFSinkLocation'
       let wrapped = fzf#wrap({
@@ -252,6 +253,20 @@ function! s:AddHighlights(source, highlights) abort
     for hl in a:highlights
         call nvim_buf_add_highlight(0, a:source, hl.group, hl.line, hl.character_start, hl.character_end)
     endfor
+endfunction
+
+" Get an variable value.
+" First try buffer local, then global, then default, then v:null.
+function! s:GetVar(...) abort
+    let name = a:0
+
+    if exists('b:' . name)
+        return get(b:, name)
+    elseif exists('g:' . name)
+        return get(g:, name)
+    else
+        return get(a:000, 1, v:null)
+    endif
 endfunction
 
 let s:id = 1
@@ -467,6 +482,11 @@ function! s:Launch() abort
 endfunction
 
 function! LanguageClient#Write(message) abort
+    if &buftype !=# '' || &filetype ==# '' || expand('%') ==# ''
+        " call s:Debug('Skip sending message')
+        return
+    endif
+
     let l:message = a:message . "\n"
     if has('nvim')
         " jobsend respond 1 for success.
@@ -692,18 +712,6 @@ function! LanguageClient#textDocument_rangeFormatting_sync(...) abort
     return l:result isnot v:null
 endfunction
 
-function! LanguageClient#rustDocument_implementations(...) abort
-    let l:params = {
-                \ 'filename': LSP#filename(),
-                \ 'text': LSP#text(),
-                \ 'line': LSP#line(),
-                \ 'character': LSP#character(),
-                \ }
-    call extend(l:params, a:0 >= 1 ? a:1 : {})
-    let l:Callback = a:0 >= 2 ? a:2 : v:null
-    return LanguageClient#Call('rustDocument/implementations', l:params, l:Callback)
-endfunction
-
 function! LanguageClient#textDocument_didOpen() abort
     return LanguageClient#Notify('textDocument/didOpen', {
                 \ 'filename': LSP#filename(),
@@ -806,10 +814,6 @@ function! LanguageClient_runSync(fn, ...) abort
 endfunction
 
 function! LanguageClient#handleBufNewFile() abort
-    if &buftype !=# '' || &filetype ==# ''
-        return
-    endif
-
     try
         call LanguageClient#Notify('languageClient/handleBufNewFile', {
                     \ 'filename': LSP#filename(),
@@ -819,13 +823,9 @@ function! LanguageClient#handleBufNewFile() abort
     endtry
 endfunction
 
-function! LanguageClient#handleBufReadPost() abort
-    if &buftype !=# '' || &filetype ==# ''
-        return
-    endif
-
+function! LanguageClient#handleFileType() abort
     try
-        call LanguageClient#Notify('languageClient/handleBufReadPost', {
+        call LanguageClient#Notify('languageClient/handleFileType', {
                     \ 'filename': LSP#filename(),
                     \ })
     catch
@@ -834,7 +834,7 @@ function! LanguageClient#handleBufReadPost() abort
 endfunction
 
 function! LanguageClient#handleTextChanged() abort
-    if &buftype !=# '' || &filetype ==# ''
+    if &buftype !=# '' || &filetype ==# '' || expand('%') ==# ''
         return
     endif
 
@@ -849,10 +849,6 @@ function! LanguageClient#handleTextChanged() abort
 endfunction
 
 function! LanguageClient#handleBufWritePost() abort
-    if &buftype !=# '' || &filetype ==# ''
-        return
-    endif
-
     try
         call LanguageClient#Notify('languageClient/handleBufWritePost', {
                     \ 'filename': LSP#filename(),
@@ -863,10 +859,6 @@ function! LanguageClient#handleBufWritePost() abort
 endfunction
 
 function! LanguageClient#handleBufDelete() abort
-    if &buftype !=# '' || &filetype ==# ''
-        return
-    endif
-
     try
         call LanguageClient#Notify('languageClient/handleBufDelete', {
                     \ 'filename': LSP#filename(),
@@ -883,10 +875,6 @@ function! LanguageClient#handleCursorMoved() abort
         return
     endif
     let s:last_cursor_line = l:cursor_line
-
-    if &buftype !=# '' || &filetype ==# ''
-        return
-    endif
 
     try
         call LanguageClient#Notify('languageClient/handleCursorMoved', {
@@ -962,10 +950,6 @@ function! LanguageClient_NCM2OnComplete(context) abort
 endfunction
 
 function! LanguageClient#explainErrorAtPoint(...) abort
-    if &buftype !=# '' || &filetype ==# ''
-        return
-    endif
-
     let l:Callback = get(a:000, 1, v:null)
     let l:params = {
                 \ 'buftype': &buftype,
@@ -1036,10 +1020,6 @@ function! LanguageClient#complete(findstart, base) abort
 endfunction
 
 function! LanguageClient#textDocument_signatureHelp(...) abort
-    if &buftype !=# '' || &filetype ==# ''
-        return
-    endif
-
     let l:params = {
                 \ 'filename': LSP#filename(),
                 \ 'line': LSP#line(),
@@ -1052,10 +1032,6 @@ function! LanguageClient#textDocument_signatureHelp(...) abort
 endfunction
 
 function! LanguageClient#workspace_applyEdit(...) abort
-    if &buftype !=# '' || &filetype ==# ''
-        return
-    endif
-
     let l:params = {
                 \ 'edit': {},
                 \ }
@@ -1065,10 +1041,6 @@ function! LanguageClient#workspace_applyEdit(...) abort
 endfunction
 
 function! LanguageClient#workspace_executeCommand(command, ...) abort
-    if &buftype !=# '' || &filetype ==# ''
-        return
-    endif
-
     let l:params = {
                 \ 'command': a:command,
                 \ 'arguments': get(a:000, 0, v:null),
@@ -1129,10 +1101,6 @@ function! LanguageClient#cquery_vars(...) abort
 endfunction
 
 function! LanguageClient#java_classFileContent(...) abort
-    if &buftype !=# '' || &filetype ==# ''
-        return
-    endif
-
     let l:params = get(a:000, 0, {})
     let l:Callback = get(a:000, 1, v:null)
     return LanguageClient#Call('java/classFileContent', l:params, l:Callback)
