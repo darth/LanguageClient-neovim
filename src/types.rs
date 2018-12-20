@@ -1,14 +1,19 @@
 use super::*;
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Fallible<T> = failure::Fallible<T>;
 
 #[derive(Debug, Fail)]
 pub enum LCError {
     #[fail(
+        display = "No language server commands found for filetype: {}",
+        languageId
+    )]
+    NoServerCommands { languageId: String },
+    #[fail(
         display = "Language server is not running for: {}",
         languageId
     )]
-    NoLanguageServer { languageId: String },
+    ServerNotRunning { languageId: String },
 }
 
 // Extensions.
@@ -154,7 +159,7 @@ pub struct State {
 }
 
 impl State {
-    pub fn new() -> Result<State> {
+    pub fn new() -> Fallible<State> {
         let logger = logger::init()?;
 
         let (tx, rx) = channel();
@@ -233,7 +238,7 @@ impl Default for SelectionUI {
 impl FromStr for SelectionUI {
     type Err = Error;
 
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> Fallible<Self> {
         match s.to_ascii_uppercase().as_str() {
             "FZF" => Ok(SelectionUI::FZF),
             "QUICKFIX" => Ok(SelectionUI::Quickfix),
@@ -259,7 +264,7 @@ impl Default for HoverPreviewOption {
 impl FromStr for HoverPreviewOption {
     type Err = Error;
 
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> Fallible<Self> {
         match s.to_ascii_uppercase().as_str() {
             "ALWAYS" => Ok(HoverPreviewOption::Always),
             "AUTO" => Ok(HoverPreviewOption::Auto),
@@ -285,7 +290,7 @@ impl Default for DiagnosticsList {
 impl FromStr for DiagnosticsList {
     type Err = Error;
 
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> Fallible<Self> {
         match s.to_ascii_uppercase().as_str() {
             "QUICKFIX" => Ok(DiagnosticsList::Quickfix),
             "LOCATION" => Ok(DiagnosticsList::Location),
@@ -548,7 +553,7 @@ impl VimCompleteItem {
     pub fn from_lsp(
         lspitem: &CompletionItem,
         complete_position: Option<u64>,
-    ) -> Result<VimCompleteItem> {
+    ) -> Fallible<VimCompleteItem> {
         let abbr = lspitem.label.clone();
         let mut word = lspitem.insert_text.clone().unwrap_or_default();
         if word.is_empty() {
@@ -556,7 +561,7 @@ impl VimCompleteItem {
                 (Some(text_edit), Some(complete_position)) => {
                     // TextEdit range start might be different from vim expected completion start.
                     // From spec, TextEdit can only span one line, i.e., the current line.
-                    if text_edit.range.start.line != complete_position {
+                    if text_edit.range.start.character != complete_position {
                         word = text_edit
                             .new_text
                             .get((complete_position as usize)..)
@@ -628,14 +633,14 @@ impl ToRpcError for Error {
 }
 
 pub trait ToParams {
-    fn to_params(self) -> Result<Params>;
+    fn to_params(self) -> Fallible<Params>;
 }
 
 impl<T> ToParams for T
 where
     T: Serialize,
 {
-    fn to_params(self) -> Result<Params> {
+    fn to_params(self) -> Fallible<Params> {
         let json_value = serde_json::to_value(self)?;
 
         let params = match json_value {
@@ -650,17 +655,17 @@ where
 }
 
 pub trait ToInt {
-    fn to_int(&self) -> Result<u64>;
+    fn to_int(&self) -> Fallible<u64>;
 }
 
 impl<'a> ToInt for &'a str {
-    fn to_int(&self) -> Result<u64> {
+    fn to_int(&self) -> Fallible<u64> {
         Ok(u64::from_str(self)?)
     }
 }
 
 impl ToInt for rpc::Id {
-    fn to_int(&self) -> Result<u64> {
+    fn to_int(&self) -> Fallible<u64> {
         match *self {
             rpc::Id::Num(id) => Ok(id),
             rpc::Id::Str(ref s) => s.as_str().to_int(),
@@ -802,35 +807,36 @@ impl DiagnosticSeverityExt for DiagnosticSeverity {
 }
 
 impl ToInt for DiagnosticSeverity {
-    fn to_int(&self) -> Result<u64> {
+    fn to_int(&self) -> Fallible<u64> {
         Ok(*self as u64)
     }
 }
 
 impl ToInt for MessageType {
-    fn to_int(&self) -> Result<u64> {
+    fn to_int(&self) -> Fallible<u64> {
         Ok(*self as u64)
     }
 }
 
 impl ToInt for DocumentHighlightKind {
-    fn to_int(&self) -> Result<u64> {
+    fn to_int(&self) -> Fallible<u64> {
         Ok(*self as u64)
     }
 }
 
 pub trait ToUsize {
-    fn to_usize(&self) -> Result<usize>;
+    fn to_usize(&self) -> Fallible<usize>;
 }
 
 impl ToUsize for u64 {
-    fn to_usize(&self) -> Result<usize> {
+    fn to_usize(&self) -> Fallible<usize> {
         Ok(*self as usize)
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub enum VimVar {
+    Bufnr,
     LanguageId,
     Filename,
     Line,
@@ -851,6 +857,7 @@ pub trait VimExp {
 impl VimExp for VimVar {
     fn to_key(&self) -> String {
         match *self {
+            VimVar::Bufnr => "bufnr",
             VimVar::LanguageId => "languageId",
             VimVar::Filename => "filename",
             VimVar::Line => "line",
@@ -866,6 +873,7 @@ impl VimExp for VimVar {
 
     fn to_exp(&self) -> String {
         match *self {
+            VimVar::Bufnr => "bufnr('')",
             VimVar::LanguageId => "&filetype",
             VimVar::Filename => "LSP#filename()",
             VimVar::Line => "LSP#line()",
@@ -952,11 +960,11 @@ pub struct WindowProgressParams {
 }
 
 pub trait Filepath {
-    fn filepath(&self) -> Result<PathBuf>;
+    fn filepath(&self) -> Fallible<PathBuf>;
 }
 
 impl Filepath for Url {
-    fn filepath(&self) -> Result<PathBuf> {
+    fn filepath(&self) -> Fallible<PathBuf> {
         self.to_file_path().or_else(|_| Ok(self.as_str().into()))
     }
 }
@@ -986,11 +994,11 @@ impl<T: Deref> OptionDeref<T> for Option<T> {
 }
 
 pub trait ToLSP<T> {
-    fn to_lsp(self) -> Result<T>;
+    fn to_lsp(self) -> Fallible<T>;
 }
 
 impl ToLSP<Vec<FileEvent>> for notify::DebouncedEvent {
-    fn to_lsp(self) -> Result<Vec<FileEvent>> {
+    fn to_lsp(self) -> Fallible<Vec<FileEvent>> {
         match self {
             notify::DebouncedEvent::Create(p) => Ok(vec![FileEvent {
                 uri: p.to_url()?,
@@ -1028,7 +1036,7 @@ impl<T> ToLSP<T> for Value
 where
     T: DeserializeOwned,
 {
-    fn to_lsp(self) -> Result<T> {
+    fn to_lsp(self) -> Fallible<T> {
         Ok(serde_json::from_value(self)?)
     }
 }
@@ -1037,7 +1045,7 @@ impl<T> ToLSP<T> for Option<Params>
 where
     T: DeserializeOwned,
 {
-    fn to_lsp(self) -> Result<T> {
+    fn to_lsp(self) -> Fallible<T> {
         serde_json::to_value(self)?.to_lsp()
     }
 }
@@ -1046,11 +1054,11 @@ pub trait FromLSP<F>
 where
     Self: Sized,
 {
-    fn from_lsp(f: &F) -> Result<Self>;
+    fn from_lsp(f: &F) -> Fallible<Self>;
 }
 
 impl FromLSP<SymbolInformation> for QuickfixEntry {
-    fn from_lsp(sym: &SymbolInformation) -> Result<Self> {
+    fn from_lsp(sym: &SymbolInformation) -> Fallible<Self> {
         let start = sym.location.range.start;
 
         Ok(QuickfixEntry {
