@@ -2626,7 +2626,7 @@ impl State {
         let (cmdargs,): (Vec<String>,) = self.gather_args(&[("cmdargs", "[]")], params)?;
         let cmdparams = vim_cmd_args_to_value(&cmdargs)?;
         let params = params.combine(&cmdparams);
-        let (languageId,): (String,) = self.gather_args(&[VimVar::LanguageId], &params)?;
+        let (languageId,filename): (String,String) = self.gather_args(&[VimVar::LanguageId, VimVar::Filename], &params)?;
 
         if self.get(|state| Ok(state.writers.contains_key(&languageId)))? {
             bail!(
