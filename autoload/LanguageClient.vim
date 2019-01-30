@@ -137,6 +137,19 @@ function! s:Echowarn(message) abort
     echohl WarningMsg | echomsg s:AddPrefix(a:message) | echohl None
 endfunction
 
+" timeout: skip function call f until this timeout, in seconds.
+function! s:Debounce(timeout, f) abort
+    " Map function to its last execute time.
+    let s:DebounceMap = {}
+    let l:lastexectime = get(s:DebounceMap, a:f)
+    if l:lastexectime == 0 || reltimefloat(reltime(l:lastexectime)) < a:timeout
+        let s:DebounceMap[a:f] = reltime()
+        return v:true
+    else
+        return v:false
+    endif
+endfunction
+
 function! s:Debug(message) abort
     if !exists('g:LanguageClient_loggingLevel')
         return
@@ -148,24 +161,25 @@ function! s:Debug(message) abort
 endfunction
 
 function! s:hasSnippetSupport() abort
-    if get(g:, 'LanguageClient_hasSnippetSupport', 1) !=# 1
-        return 0
+    if exists('g:LanguageClient_hasSnippetSupport')
+        return g:LanguageClient_hasSnippetSupport !=# 0
     endif
 
-    " https://github.com/SirVer/ultisnips
-    if exists('g:did_plugin_ultisnips')
-        return 1
-    endif
     " https://github.com/Shougo/neosnippet.vim
     if exists('g:loaded_neosnippet')
         return 1
     endif
-    " https://github.com/garbas/vim-snipmate
-    if exists('g:loaded_snips')
-        return 1
-    endif
 
     return 0
+endfunction
+
+function! s:useVirtualText() abort
+    let l:use = s:GetVar('LanguageClient_useVirtualText')
+    if l:use !=# v:null
+        return !!l:use
+    endif
+
+    return exists('*nvim_buf_set_virtual_text')
 endfunction
 
 function! s:IsTrue(v) abort
@@ -185,6 +199,20 @@ endfunction
 " Get all listed buffer file names.
 function! s:Bufnames() abort
     return map(filter(range(0,bufnr('$')), 'buflisted(v:val)'), 'fnamemodify(bufname(v:val), '':p'')')
+endfunction
+
+function! s:set_virtual_texts(buf_id, ns_id, line_start, line_end, virtual_texts) abort
+    " VirtualText: map with keys line, text and hl_group.
+
+    if !exists('*nvim_buf_set_virtual_text')
+        return
+    endif
+
+    call nvim_buf_clear_namespace(a:buf_id, a:ns_id, a:line_start, a:line_end)
+
+    for vt in a:virtual_texts
+        call nvim_buf_set_virtual_text(a:buf_id, a:ns_id, vt['line'], [[vt['text'], vt['hl_group']]], {})
+    endfor
 endfunction
 
 function! s:getInput(prompt, default) abort
@@ -239,6 +267,7 @@ function! s:Edit(action, path) abort
     " Avoid the 'not saved' warning.
     if l:action ==# 'edit' && l:bufnr != -1
         execute 'buffer' l:bufnr
+        set buflisted
         return
     endif
 
@@ -260,7 +289,7 @@ function! s:AddHighlights(source, highlights) abort
 endfunction
 
 " Get an variable value.
-" First try buffer local, then global, then default, then v:null.
+" Get variable from uffer local, or else global, or else default, or else v:null.
 function! s:GetVar(...) abort
     let name = a:1
 
@@ -689,6 +718,13 @@ function! LanguageClient#textDocument_formatting(...) abort
     return LanguageClient#Call('textDocument/formatting', l:params, l:Callback)
 endfunction
 
+function! LanguageClient#textDocument_formatting_sync(...) abort
+    let l:result = LanguageClient_runSync('LanguageClient#textDocument_formatting', {
+                \ 'handle': v:true,
+                \ })
+    return l:result isnot v:null
+endfunction
+
 function! LanguageClient#textDocument_rangeFormatting(...) abort
     let l:Callback = get(a:000, 1, v:null)
     let l:params = {
@@ -834,9 +870,11 @@ endfunction
 
 function! LanguageClient#handleFileType() abort
     try
-        call LanguageClient#Notify('languageClient/handleFileType', {
-                    \ 'filename': LSP#filename(),
-                    \ })
+        if s:Debounce(2, 'LanguageClient#handleFileType')
+            call LanguageClient#Notify('languageClient/handleFileType', {
+                        \ 'filename': LSP#filename(),
+                        \ })
+        endif
     catch
         call s:Debug('LanguageClient caught exception: ' . string(v:exception))
     endtry

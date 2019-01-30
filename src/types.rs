@@ -1,4 +1,6 @@
 use super::*;
+use crate::rpcclient::RpcClient;
+use std::sync::mpsc;
 
 pub type Fallible<T> = failure::Fallible<T>;
 
@@ -9,10 +11,7 @@ pub enum LCError {
         languageId
     )]
     NoServerCommands { languageId: String },
-    #[fail(
-        display = "Language server is not running for: {}",
-        languageId
-    )]
+    #[fail(display = "Language server is not running for: {}", languageId)]
     ServerNotRunning { languageId: String },
 }
 
@@ -70,18 +69,19 @@ impl SyncWrite for BufWriter<ChildStdin> {}
 impl SyncWrite for BufWriter<TcpStream> {}
 
 pub type Id = u64;
+pub type LanguageId = Option<String>;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
-    MethodCall(Option<String>, rpc::MethodCall),
-    Notification(Option<String>, rpc::Notification),
+    MethodCall(LanguageId, rpc::MethodCall),
+    Notification(LanguageId, rpc::Notification),
     Output(rpc::Output),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Call {
-    MethodCall(Option<String>, rpc::MethodCall),
-    Notification(Option<String>, rpc::Notification),
+    MethodCall(LanguageId, rpc::MethodCall),
+    Notification(LanguageId, rpc::Notification),
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -93,28 +93,25 @@ pub struct HighlightSource {
 #[derive(Serialize)]
 pub struct State {
     // Program state.
-    pub id: Id,
     #[serde(skip_serializing)]
-    pub tx: Sender<Message>,
-    #[serde(skip_serializing)]
-    pub rx: Receiver<Message>,
-    pub pending_calls: VecDeque<Call>,
-    pub pending_outputs: HashMap<Id, rpc::Output>,
+    pub tx: crossbeam_channel::Sender<Call>,
 
-    pub child_ids: HashMap<String, u32>,
     #[serde(skip_serializing)]
-    pub writers: HashMap<String, Box<dyn SyncWrite>>,
+    pub clients: HashMap<LanguageId, RpcClient>,
+
     pub capabilities: HashMap<String, Value>,
     pub registrations: Vec<Registration>,
     pub roots: HashMap<String, String>,
     pub text_documents: HashMap<String, TextDocumentItem>,
     pub text_documents_metadata: HashMap<String, TextDocumentItemMetadata>,
     // filename => diagnostics.
+    // TODO: convert to filename => line => diagnostics, where line => diagnostics is a TreeMap.
     pub diagnostics: HashMap<String, Vec<Diagnostic>>,
     #[serde(skip_serializing)]
     pub line_diagnostics: HashMap<(String, u64), String>,
     pub signs: HashMap<String, Vec<Sign>>,
     pub signs_placed: HashMap<String, Vec<Sign>>,
+    pub namespace_id: Option<i64>,
     pub highlight_source: Option<u64>,
     pub highlights: HashMap<String, Vec<Highlight>>,
     pub highlights_placed: HashMap<String, Vec<Highlight>>,
@@ -125,7 +122,7 @@ pub struct State {
     #[serde(skip_serializing)]
     pub watchers: HashMap<String, notify::RecommendedWatcher>,
     #[serde(skip_serializing)]
-    pub watcher_rxs: HashMap<String, Receiver<notify::DebouncedEvent>>,
+    pub watcher_rxs: HashMap<String, mpsc::Receiver<notify::DebouncedEvent>>,
 
     pub is_nvim: bool,
     pub last_cursor_line: u64,
@@ -136,6 +133,7 @@ pub struct State {
     pub serverCommands: HashMap<String, Vec<String>>,
     pub autoStart: bool,
     pub selectionUI: SelectionUI,
+    pub selectionUI_autoOpen: bool,
     pub trace: Option<TraceOption>,
     pub diagnosticsEnable: bool,
     pub diagnosticsList: DiagnosticsList,
@@ -150,6 +148,7 @@ pub struct State {
     pub wait_output_timeout: Duration,
     pub hoverPreview: HoverPreviewOption,
     pub completionPreferTextEdit: bool,
+    pub use_virtual_text: bool,
 
     pub loggingFile: Option<String>,
     pub loggingLevel: log::LevelFilter,
@@ -159,20 +158,25 @@ pub struct State {
 }
 
 impl State {
-    pub fn new() -> Fallible<State> {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(tx: crossbeam_channel::Sender<Call>) -> Fallible<State> {
         let logger = logger::init()?;
 
-        let (tx, rx) = channel();
+        let client = RpcClient::new(
+            None,
+            BufReader::new(std::io::stdin()),
+            BufWriter::new(std::io::stdout()),
+            None,
+            tx.clone(),
+        )?;
 
         Ok(State {
-            id: 0,
             tx,
-            rx,
-            pending_calls: VecDeque::new(),
-            pending_outputs: HashMap::new(),
 
-            child_ids: HashMap::new(),
-            writers: HashMap::new(),
+            clients: hashmap! {
+                None => client,
+            },
+
             capabilities: HashMap::new(),
             registrations: vec![],
             roots: HashMap::new(),
@@ -182,6 +186,7 @@ impl State {
             line_diagnostics: HashMap::new(),
             signs: HashMap::new(),
             signs_placed: HashMap::new(),
+            namespace_id: None,
             highlight_source: None,
             highlights: HashMap::new(),
             highlights_placed: HashMap::new(),
@@ -199,6 +204,7 @@ impl State {
             serverCommands: HashMap::new(),
             autoStart: true,
             selectionUI: SelectionUI::LocationList,
+            selectionUI_autoOpen: true,
             trace: None,
             diagnosticsEnable: true,
             diagnosticsList: DiagnosticsList::Quickfix,
@@ -213,6 +219,7 @@ impl State {
             wait_output_timeout: Duration::from_secs(10),
             hoverPreview: HoverPreviewOption::default(),
             completionPreferTextEdit: false,
+            use_virtual_text: true,
             loggingFile: None,
             loggingLevel: log::LevelFilter::Warn,
             serverStderr: None,
@@ -222,7 +229,7 @@ impl State {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum SelectionUI {
     FZF,
     Quickfix,
@@ -248,7 +255,7 @@ impl FromStr for SelectionUI {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum HoverPreviewOption {
     Always,
     Auto,
@@ -274,7 +281,7 @@ impl FromStr for HoverPreviewOption {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum DiagnosticsList {
     Quickfix,
     Location,
@@ -306,6 +313,7 @@ pub struct DiagnosticsDisplay {
     pub texthl: String,
     pub signText: String,
     pub signTexthl: String,
+    pub virtualTexthl: String,
 }
 
 impl DiagnosticsDisplay {
@@ -318,6 +326,7 @@ impl DiagnosticsDisplay {
                 texthl: "ALEError".to_owned(),
                 signText: "✖".to_owned(),
                 signTexthl: "ALEErrorSign".to_owned(),
+                virtualTexthl: "Error".to_owned(),
             },
         );
         map.insert(
@@ -327,6 +336,7 @@ impl DiagnosticsDisplay {
                 texthl: "ALEWarning".to_owned(),
                 signText: "⚠".to_owned(),
                 signTexthl: "ALEWarningSign".to_owned(),
+                virtualTexthl: "Todo".to_owned(),
             },
         );
         map.insert(
@@ -336,6 +346,7 @@ impl DiagnosticsDisplay {
                 texthl: "ALEInfo".to_owned(),
                 signText: "ℹ".to_owned(),
                 signTexthl: "ALEInfoSign".to_owned(),
+                virtualTexthl: "Todo".to_owned(),
             },
         );
         map.insert(
@@ -345,6 +356,7 @@ impl DiagnosticsDisplay {
                 texthl: "ALEInfo".to_owned(),
                 signText: "➤".to_owned(),
                 signTexthl: "ALEInfoSign".to_owned(),
+                virtualTexthl: "Todo".to_owned(),
             },
         );
         map
@@ -371,10 +383,12 @@ impl Sign {
 
     fn get_id(line: u64, severity: Option<DiagnosticSeverity>) -> u64 {
         let base_id = 75_000;
-        base_id + (line - 1) * 4 + severity
-            .unwrap_or(DiagnosticSeverity::Hint)
-            .to_int()
-            .unwrap_or(4)
+        base_id
+            + (line - 1) * 4
+            + severity
+                .unwrap_or(DiagnosticSeverity::Hint)
+                .to_int()
+                .unwrap_or(4)
             - 1
     }
 }
@@ -727,21 +741,24 @@ impl ToString for NumberOrString {
 
 pub trait ToDisplay {
     fn to_display(&self) -> Vec<String>;
+    fn vim_filetype(&self) -> Option<String> {
+        None
+    }
 }
 
 impl ToDisplay for lsp::MarkedString {
     fn to_display(&self) -> Vec<String> {
-        match *self {
-            MarkedString::String(ref s) => s.lines().map(|i| i.to_string()).collect(),
-            MarkedString::LanguageString(ref ls) => {
-                let mut buf = Vec::new();
+        let s = match self {
+            MarkedString::String(ref s) => s,
+            MarkedString::LanguageString(ref ls) => &ls.value,
+        };
+        s.lines().map(|i| i.to_string()).collect()
+    }
 
-                buf.push(format!("```{}", ls.language));
-                buf.extend(ls.value.lines().map(|i| i.to_string()));
-                buf.push("```".to_string());
-
-                buf
-            }
+    fn vim_filetype(&self) -> Option<String> {
+        match self {
+            MarkedString::String(_) => Some("markdown".to_string()),
+            MarkedString::LanguageString(ref ls) => Some(ls.language.clone()),
         }
     }
 }
@@ -750,15 +767,51 @@ impl ToDisplay for MarkupContent {
     fn to_display(&self) -> Vec<String> {
         self.value.lines().map(str::to_string).collect()
     }
+
+    fn vim_filetype(&self) -> Option<String> {
+        match self.kind {
+            MarkupKind::Markdown => Some("markdown".to_string()),
+            MarkupKind::PlainText => Some("text".to_string()),
+        }
+    }
 }
 
 impl ToDisplay for Hover {
     fn to_display(&self) -> Vec<String> {
         match self.contents {
             HoverContents::Scalar(ref ms) => ms.to_display(),
-            HoverContents::Array(ref arr) => arr.iter().flat_map(ToDisplay::to_display).collect(),
+            HoverContents::Array(ref arr) => arr
+                .iter()
+                .flat_map(|ms| {
+                    if let MarkedString::LanguageString(ref ls) = ms {
+                        let mut buf = Vec::new();
+
+                        buf.push(format!("```{}", ls.language));
+                        buf.extend(ls.value.lines().map(|i| i.to_string()));
+                        buf.push("```".to_string());
+
+                        buf
+                    } else {
+                        ms.to_display()
+                    }
+                })
+                .collect(),
             HoverContents::Markup(ref mc) => mc.to_display(),
         }
+    }
+
+    fn vim_filetype(&self) -> Option<String> {
+        match self.contents {
+            HoverContents::Scalar(ref ms) => ms.vim_filetype(),
+            HoverContents::Array(_) => Some("markdown".to_string()),
+            HoverContents::Markup(ref mc) => mc.vim_filetype(),
+        }
+    }
+}
+
+impl ToDisplay for str {
+    fn to_display(&self) -> Vec<String> {
+        self.lines().map(|s| s.to_string()).collect()
     }
 }
 
@@ -868,7 +921,8 @@ impl VimExp for VimVar {
             VimVar::GotoCmd => "gotoCmd",
             VimVar::Handle => "handle",
             VimVar::IncludeDeclaration => "includeDeclaration",
-        }.to_owned()
+        }
+        .to_owned()
     }
 
     fn to_exp(&self) -> String {
@@ -882,7 +936,8 @@ impl VimExp for VimVar {
             VimVar::Cword => "expand('<cword>')",
             VimVar::NewName | VimVar::GotoCmd => "v:null",
             VimVar::Handle | VimVar::IncludeDeclaration => "v:true",
-        }.to_owned()
+        }
+        .to_owned()
     }
 }
 
