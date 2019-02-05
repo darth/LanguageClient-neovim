@@ -186,11 +186,20 @@ function! s:FZF(source, sink) abort
             let l:options = []
         endif
     endif
-    call fzf#run(fzf#wrap({
-                \ 'source': a:source,
-                \ 'sink': function(a:sink),
-                \ 'options': l:options,
-                \ }))
+    if a:sink ==# 's:LanguageClient_FZFSinkLocation'
+      let wrapped = fzf#wrap({
+      \ 'source': a:source,
+      \ 'options': l:options,
+      \ })
+      let wrapped['sink*'] = function(a:sink)
+    else
+      let wrapped = fzf#wrap({
+      \ 'source': a:source,
+      \ 'sink': function(a:sink),
+      \ 'options': l:options,
+      \ })
+    endif
+    call fzf#run(wrapped)
     if has('nvim')
         call feedkeys('i')
     endif
@@ -900,8 +909,17 @@ function! LanguageClient#handleVimLeavePre() abort
     endtry
 endfunction
 
-function! s:LanguageClient_FZFSinkLocation(line) abort
-    return LanguageClient#Notify('LanguageClient_FZFSinkLocation', [a:line])
+let s:fzf_action = {
+\ 'ctrl-t': 'tab split',
+\ 'ctrl-x': 'split',
+\ 'ctrl-v': 'vsplit'
+\ }
+
+function! s:LanguageClient_FZFSinkLocation(lines) abort
+    let actions_dict = get(g:, 'fzf_action', s:fzf_action)
+    let action = a:lines[0] ==# '' ? 'edit' : actions_dict[a:lines[0]]
+    let location = a:lines[1]
+    return LanguageClient#Notify('LanguageClient_FZFSinkLocation', [action, location])
 endfunction
 
 function! LanguageClient_FZFSinkCommand(selection) abort

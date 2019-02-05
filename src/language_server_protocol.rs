@@ -2574,9 +2574,10 @@ impl LanguageClient {
         if lines.is_empty() {
             err_msg("No selection!");
         }
+        let cmd = lines.get(0).ok_or_else(|| format_err!("Failed to get action! lines: {:?}", lines))?.to_owned();
 
         let location = lines
-            .get(0)
+            .get(1)
             .ok_or_else(|| format_err!("Failed to get line! lines: {:?}", lines))?
             .split('\t')
             .next()
@@ -2604,7 +2605,7 @@ impl LanguageClient {
             .to_int()?
             - 1;
 
-        self.vim()?.edit(&None, &filename)?;
+        self.vim()?.edit(&Some(cmd), &filename)?;
         self.vim()?.cursor(line + 1, character + 1)?;
 
         info!("End {}", NOTIFICATION__FZFSinkLocation);
