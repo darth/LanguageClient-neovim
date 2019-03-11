@@ -101,15 +101,14 @@ impl Vim {
         Ok(insert_spaces == 1)
     }
 
+    pub fn get_text(&self, bufname: &str) -> Fallible<Vec<String>> {
+        self.rpcclient.call("LSP#text", json!([bufname]))
+    }
+
     pub fn get_handle(&self, params: &Value) -> Fallible<bool> {
         let key = "handle";
 
         try_get(key, params)?.map_or_else(|| Ok(true), Ok)
-    }
-
-    pub fn getbufline(&self, bufname: &str, start: &str, end: &str) -> Fallible<Vec<String>> {
-        self.rpcclient
-            .call("getbufline", json!([bufname, start, end]))
     }
 
     pub fn echo(&self, message: impl AsRef<str>) -> Fallible<()> {
@@ -212,21 +211,12 @@ impl Vim {
     pub fn set_signs(
         &self,
         filename: &str,
-        signs_to_delete: &Vec<Sign>,
         signs_to_add: &Vec<Sign>,
+        signs_to_delete: &Vec<Sign>,
     ) -> Fallible<i8> {
         self.rpcclient.call(
             "s:set_signs",
-            json!([filename, signs_to_delete, signs_to_add]),
+            json!([filename, signs_to_add, signs_to_delete]),
         )
     }
-}
-
-// TODO: move to types.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RawMessage {
-    Notification(rpc::Notification),
-    MethodCall(rpc::MethodCall),
-    Output(rpc::Output),
 }

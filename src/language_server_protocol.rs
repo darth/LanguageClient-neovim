@@ -820,12 +820,14 @@ impl LanguageClient {
         })??;
 
         let mut filenames = vec![];
-        self.get(|state| {
-            for f in state.diagnostics.keys() {
+        self.update(|state| {
+            for (f, diag_list) in state.diagnostics.iter_mut() {
                 if f.starts_with(&root) {
                     filenames.push(f.clone());
+                    diag_list.clear();
                 }
             }
+            Ok(())
         })?;
         for f in filenames {
             self.process_diagnostics(&f, &[])?;
@@ -833,7 +835,6 @@ impl LanguageClient {
         self.languageClient_handleCursorMoved(&Value::Null)?;
 
         self.update(|state| {
-            state.diagnostics.retain(|f, _| !f.starts_with(&root));
             state.clients.remove(&Some(languageId.into()));
             state.last_cursor_line = 0;
             state.text_documents.retain(|f, _| !f.starts_with(&root));
@@ -1329,13 +1330,23 @@ impl LanguageClient {
         if help.signatures.is_empty() {
             return Ok(Value::Null);
         }
+
+        // active_signature may be negative value.
+        // So if it is negative value, we convert it into zero.
+        let active_signature_index = help.active_signature.unwrap_or(0).max(0) as usize;
+
         let active_signature = help
             .signatures
-            .get(help.active_signature.unwrap_or(0).to_usize()?)
+            .get(active_signature_index)
             .ok_or_else(|| err_msg("Failed to get active signature"))?;
+
+        // active_signature may be negative value.
+        // So if it is negative value, we convert it into zero.
+        let active_parameter_index = help.active_parameter.unwrap_or(0).max(0) as usize;
+
         let active_parameter: Option<&ParameterInformation>;
         if let Some(ref parameters) = active_signature.parameters {
-            active_parameter = parameters.get(help.active_parameter.unwrap_or(0).to_usize()?);
+            active_parameter = parameters.get(active_parameter_index);
         } else {
             active_parameter = None;
         }
@@ -1611,7 +1622,7 @@ impl LanguageClient {
         info!("Begin {}", lsp::notification::DidOpenTextDocument::METHOD);
         let filename = self.vim()?.get_filename(params)?;
         let languageId = self.vim()?.get_languageId(&filename, params)?;
-        let text = self.vim()?.getbufline(&filename, "0", "$")?;
+        let text = self.vim()?.get_text(&filename)?;
 
         let text_document = TextDocumentItem {
             uri: filename.to_url()?,
@@ -1655,7 +1666,7 @@ impl LanguageClient {
             return self.textDocument_didOpen(params);
         }
 
-        let text = self.vim()?.getbufline(&filename, "0", "$")?.join("\n");
+        let text = self.vim()?.get_text(&filename)?.join("\n");
         let text_state = self.get(|state| {
             state
                 .text_documents
@@ -1821,6 +1832,29 @@ impl LanguageClient {
         self.vim()?.echomsg(&msg)?;
         info!("End {}", lsp::notification::ShowMessage::METHOD);
         Ok(())
+    }
+
+    pub fn window_showMessageRequest(&self, params: &Value) -> Fallible<Value> {
+        info!("Begin {}", lsp::request::ShowMessageRequest::METHOD);
+        let msg_params: ShowMessageRequestParams = params.clone().to_lsp()?;
+        let msg_actions = msg_params.actions.unwrap_or_default();
+        let mut options = Vec::with_capacity(msg_actions.len() + 1);
+        options.push(msg_params.message);
+        options.extend(
+            msg_actions
+                .iter()
+                .enumerate()
+                .map(|(i, item)| format!("{}) {}", i + 1, item.title)),
+        );
+
+        let mut v = Value::Null;
+        let index: Option<usize> = self.vim()?.rpcclient.call("s:inputlist", options)?;
+        if let Some(index) = index {
+            v = serde_json::to_value(msg_actions.get(index - 1))?;
+        }
+
+        info!("End {}", lsp::request::ShowMessageRequest::METHOD);
+        Ok(v)
     }
 
     pub fn client_registerCapability(&self, languageId: &str, params: &Value) -> Fallible<Value> {
@@ -2191,37 +2225,50 @@ impl LanguageClient {
 
         let bufnr = self.vim()?.get_bufnr(&filename, params)?;
         let viewport = self.vim()?.get_viewport(params)?;
-        let viewport_diffs = self.update(|state| {
-            let diffs = viewport.diff(state.viewports.get(&filename));
-            state.viewports.insert(filename.clone(), viewport);
-            Ok(diffs)
-        })?;
 
-        let mut signs_next: Vec<_> = self.update(|state| {
-            let mut signs = vec![];
-            for viewport in &viewport_diffs {
-                signs.extend(
-                    state
-                        .diagnostics
-                        .entry(filename.clone())
-                        .or_default()
-                        .iter()
-                        .filter_map(|diag| {
-                            if viewport.overlaps(diag.range) {
-                                let name = format!(
-                                    "LanguageClient{:?}",
-                                    diag.severity.unwrap_or(DiagnosticSeverity::Hint)
-                                );
-                                Some(Sign::new(diag.range.start.line, name))
-                            } else {
-                                None
-                            }
-                        }),
-                );
-            }
-            Ok(signs)
+        let signs_next: Vec<_> = self.update(|state| {
+            Ok(state
+                .diagnostics
+                .entry(filename.clone())
+                .or_default()
+                .iter()
+                .filter_map(|diag| {
+                    if viewport.overlaps(diag.range) {
+                        let name = format!(
+                            "LanguageClient{:?}",
+                            diag.severity.unwrap_or(DiagnosticSeverity::Hint)
+                        );
+                        Some(Sign::new(diag.range.start.line, name))
+                    } else {
+                        None
+                    }
+                })
+                .collect())
         })?;
-        for sign in &mut signs_next {
+        let signs_prev: Vec<_> = self.update(|state| {
+            Ok(state
+                .signs
+                .entry(filename.clone())
+                .or_default()
+                .range(viewport.start..viewport.end)
+                .map(|(_, sign)| sign.clone())
+                .collect())
+        })?;
+        let mut signs_to_add = vec![];
+        let mut signs_to_delete = vec![];
+        let diffs = diff::slice(&signs_next, &signs_prev);
+        for diff in diffs {
+            match diff {
+                diff::Result::Left(s) => {
+                    signs_to_add.push(s.clone());
+                }
+                diff::Result::Right(s) => {
+                    signs_to_delete.push(s.clone());
+                }
+                _ => {}
+            }
+        }
+        for sign in &mut signs_to_add {
             if sign.id == 0 {
                 sign.id = self.update(|state| {
                     state.sign_next_id += 1;
@@ -2229,29 +2276,15 @@ impl LanguageClient {
                 })?;
             }
         }
-        let signs_prev = self.update(|state| {
-            let mut signs = vec![];
-            for viewport in &viewport_diffs {
-                signs.extend(
-                    state
-                        .signs
-                        .entry(filename.clone())
-                        .or_default()
-                        .range(viewport.start..viewport.end)
-                        .map(|(_, sign)| sign.clone()),
-                );
-            }
-            Ok(signs)
-        })?;
-        // TODO: diff.
-        self.vim()?.set_signs(&filename, &signs_prev, &signs_next)?;
+        self.vim()?
+            .set_signs(&filename, &signs_to_add, &signs_to_delete)?;
         self.update(|state| {
             let signs = state.signs.entry(filename.clone()).or_default();
-            for sign in signs_prev {
-                signs.remove(&sign.line);
-            }
-            for sign in signs_next {
+            for sign in signs_to_add {
                 signs.insert(sign.line, sign);
+            }
+            for sign in signs_to_delete {
+                signs.remove(&sign.line);
             }
             Ok(())
         })?;
@@ -2310,38 +2343,35 @@ impl LanguageClient {
         if self.get(|state| state.use_virtual_text)? {
             let namespace_id = self.get_or_create_namespace()?;
 
-            for viewport in &viewport_diffs {
-                let mut virtual_texts = vec![];
-                self.update(|state| {
-                    if let Some(diag_list) = state.diagnostics.get(&filename) {
-                        for diag in diag_list {
-                            if viewport.overlaps(diag.range) {
-                                virtual_texts.push(VirtualText {
-                                    line: diag.range.start.line,
-                                    text: diag.message.replace("\n", "  ").clone(),
-                                    hl_group: state
-                                        .diagnosticsDisplay
-                                        .get(
-                                            &(diag.severity.unwrap_or(DiagnosticSeverity::Hint)
-                                                as u64),
-                                        )
-                                        .ok_or_else(|| err_msg("Failed to get display"))?
-                                        .virtualTexthl
-                                        .clone(),
-                                });
-                            }
+            let mut virtual_texts = vec![];
+            self.update(|state| {
+                if let Some(diag_list) = state.diagnostics.get(&filename) {
+                    for diag in diag_list {
+                        if viewport.overlaps(diag.range) {
+                            virtual_texts.push(VirtualText {
+                                line: diag.range.start.line,
+                                text: diag.message.replace("\n", "  ").clone(),
+                                hl_group: state
+                                    .diagnosticsDisplay
+                                    .get(
+                                        &(diag.severity.unwrap_or(DiagnosticSeverity::Hint) as u64),
+                                    )
+                                    .ok_or_else(|| err_msg("Failed to get display"))?
+                                    .virtualTexthl
+                                    .clone(),
+                            });
                         }
                     }
-                    Ok(())
-                })?;
-                self.vim()?.set_virtual_texts(
-                    bufnr,
-                    namespace_id,
-                    viewport.start,
-                    viewport.end,
-                    &virtual_texts,
-                )?;
-            }
+                }
+                Ok(())
+            })?;
+            self.vim()?.set_virtual_texts(
+                bufnr,
+                namespace_id,
+                viewport.start,
+                viewport.end,
+                &virtual_texts,
+            )?;
         }
 
         info!("End {}", NOTIFICATION__HandleCursorMoved);
