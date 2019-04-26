@@ -219,7 +219,7 @@ function! s:FZF(source, sink) abort
       \ })
     endif
     call fzf#run(wrapped)
-    if has('nvim')
+    if has('nvim') && !has('nvim-0.4')
         call feedkeys('i')
     endif
 endfunction
