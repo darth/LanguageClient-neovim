@@ -25,7 +25,10 @@ impl LanguageClient {
 
     pub fn loop_call(&self, rx: &crossbeam_channel::Receiver<Call>) -> Fallible<()> {
         for call in rx.iter() {
-            let language_client = Self(self.0.clone());
+            let language_client = LanguageClient {
+                state_mutex: self.state_mutex.clone(),
+                clients_mutex: self.clients_mutex.clone(), // not sure if useful to clone this
+            };
             thread::spawn(move || {
                 if let Err(err) = language_client.handle_call(call) {
                     error!("Error handling request:\n{:?}", err);
@@ -624,7 +627,11 @@ impl LanguageClient {
                             let endLine =
                                 vec![dn.range.end.line + 1, 1, dn.range.end.character + 1];
                             middleLines.push(startLine);
-                            middleLines.push(endLine);
+                            // For a multi-ringe range ending at the exact start of the last line,
+                            // don't highlight the first character of the last line.
+                            if dn.range.end.character > 0 {
+                                middleLines.push(endLine);
+                            }
                             middleLines
                         }
                     })
@@ -2734,7 +2741,38 @@ impl LanguageClient {
                     )
                 })
         })??;
-        self.preview(diag.message.as_str())?;
+
+        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let root = self.get(|state| state.roots.get(&languageId).cloned().unwrap_or_default())?;
+        let rootUri = root.to_url()?;
+
+        let mut explanation = diag.message;
+        if let Some(related_information) = diag.related_information {
+            explanation = format!("{}\n", explanation);
+            for ri in related_information {
+                let prefix = format!("{}/", rootUri);
+                let uri = if ri.location.uri.as_str().starts_with(prefix.as_str()) {
+                    // Heuristic: if start of stringified URI matches rootUri, abbreviate it away
+                    &ri.location.uri.as_str()[rootUri.as_str().len() + 1..]
+                } else {
+                    ri.location.uri.as_str()
+                };
+                if ri.location.uri.scheme() == "file" {
+                    explanation = format!(
+                        "{}\n{}:{}: {}",
+                        explanation,
+                        uri,
+                        &ri.location.range.start.line + 1,
+                        &ri.message
+                    );
+                } else {
+                    // Heuristic: if scheme is not file, don't show line numbers
+                    explanation = format!("{}\n{}: {}", explanation, uri, &ri.message);
+                }
+            }
+        }
+
+        self.preview(explanation.as_str())?;
 
         info!("End {}", REQUEST__ExplainErrorAtPoint);
         Ok(Value::Null)
@@ -2823,6 +2861,29 @@ impl LanguageClient {
         let cmdargs: Vec<String> = try_get("cmdargs", params)?.unwrap_or_default();
         let cmdparams = vim_cmd_args_to_value(&cmdargs)?;
         let params = params.combine(&cmdparams);
+
+        // When multiple buffers get opened up concurrently,
+        // startServer gets called concurrently.
+        // This lock ensures that at most one language server is starting up at a time per
+        // languageId.
+        // We keep the mutex in scope to satisfy the borrow checker.
+        // This ensures that the mutex isn't garbage collected while the MutexGuard is held.
+        //
+        // - e.g. prevents starting multiple servers with `vim -p`.
+        // - This continues to allow distinct language servers to start up concurrently
+        //   by languageId (e.g. java and rust)
+        // - Revisit this when more than one server is allowed per languageId.
+        //   (ensure that the mutex is acquired by what starts the group of servers)
+        //
+        // TODO: May want to lock other methods that update the list of clients.
+        let mutex_for_language_id = self.get_client_update_mutex(Some(languageId.clone()))?;
+        let _raii_lock: MutexGuard<()> = mutex_for_language_id.lock().map_err(|err| {
+            format_err!(
+                "Failed to lock client creation for languageId {:?}: {:?}",
+                languageId,
+                err
+            )
+        })?;
 
         if self.get(|state| state.clients.contains_key(&Some(languageId.clone())))? {
             return Ok(json!({}));
