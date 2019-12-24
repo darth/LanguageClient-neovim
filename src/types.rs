@@ -1,7 +1,6 @@
 use super::*;
 use crate::rpcclient::RpcClient;
 use crate::sign::Sign;
-use crate::viewport::Viewport;
 use crate::vim::Vim;
 use std::collections::BTreeMap;
 use std::sync::mpsc;
@@ -99,7 +98,7 @@ pub struct HighlightSource {
 pub struct State {
     // Program state.
     #[serde(skip_serializing)]
-    pub tx: crossbeam_channel::Sender<Call>,
+    pub tx: crossbeam::channel::Sender<Call>,
 
     #[serde(skip_serializing)]
     pub clients: HashMap<LanguageId, RpcClient>,
@@ -136,7 +135,6 @@ pub struct State {
     pub last_cursor_line: u64,
     pub last_line_diagnostic: String,
     pub stashed_codeAction_actions: Vec<CodeAction>,
-    pub viewports: HashMap<String, Viewport>,
 
     // User settings.
     pub serverCommands: HashMap<String, Vec<String>>,
@@ -170,7 +168,7 @@ pub struct State {
 
 impl State {
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(tx: crossbeam_channel::Sender<Call>) -> Fallible<Self> {
+    pub fn new(tx: crossbeam::channel::Sender<Call>) -> Fallible<Self> {
         let logger = logger::init()?;
 
         let client = RpcClient::new(
@@ -213,7 +211,6 @@ impl State {
             last_cursor_line: 0,
             last_line_diagnostic: " ".into(),
             stashed_codeAction_actions: vec![],
-            viewports: HashMap::new(),
 
             serverCommands: HashMap::new(),
             autoStart: true,
@@ -861,11 +858,11 @@ pub trait VimExp {
 
 impl<'a> VimExp for &'a str {
     fn to_key(&self) -> String {
-        self.to_string()
+        (*self).to_string()
     }
 
     fn to_exp(&self) -> String {
-        self.to_string()
+        (*self).to_string()
     }
 }
 
@@ -956,16 +953,6 @@ impl Default for TextDocumentItemMetadata {
     }
 }
 
-pub trait OptionDeref<T: Deref> {
-    fn as_deref(&self) -> Option<&T::Target>;
-}
-
-impl<T: Deref> OptionDeref<T> for Option<T> {
-    fn as_deref(&self) -> Option<&T::Target> {
-        self.as_ref().map(Deref::deref)
-    }
-}
-
 pub trait ToLSP<T> {
     fn to_lsp(self) -> Fallible<T>;
 }
@@ -1042,6 +1029,53 @@ impl FromLSP<SymbolInformation> for QuickfixEntry {
             nr: None,
             typ: None,
         })
+    }
+}
+
+impl FromLSP<Vec<lsp::SymbolInformation>> for Vec<QuickfixEntry> {
+    fn from_lsp(symbols: &Vec<lsp::SymbolInformation>) -> Fallible<Self> {
+        symbols.iter().map(QuickfixEntry::from_lsp).collect()
+    }
+}
+
+impl FromLSP<Vec<lsp::DocumentSymbol>> for Vec<QuickfixEntry> {
+    fn from_lsp(document_symbols: &Vec<lsp::DocumentSymbol>) -> Fallible<Self> {
+        let mut symbols = Vec::new();
+
+        fn walk_document_symbol(
+            buffer: &mut Vec<QuickfixEntry>,
+            parent: Option<&str>,
+            ds: &lsp::DocumentSymbol,
+        ) {
+            let start = ds.selection_range.start;
+
+            let name = if let Some(parent) = parent {
+                format!("{}::{}", parent, ds.name)
+            } else {
+                ds.name.clone()
+            };
+
+            buffer.push(QuickfixEntry {
+                filename: "".to_string(),
+                lnum: start.line + 1,
+                col: Some(start.character + 1),
+                text: Some(name),
+                nr: None,
+                typ: None,
+            });
+
+            if let Some(children) = &ds.children {
+                for child in children {
+                    walk_document_symbol(buffer, Some(&ds.name), child);
+                }
+            }
+        }
+
+        for ds in document_symbols {
+            walk_document_symbol(&mut symbols, None, ds);
+        }
+
+        Ok(symbols)
     }
 }
 
