@@ -8,7 +8,8 @@ let s:TYPE = {
 \   'dict':    type({}),
 \   'funcref': type(function('call'))
 \ }
-let s:FLOAT_WINDOW_AVAILABLE = has('nvim') && exists('*nvim_open_win')
+let s:FLOAT_WINDOW_AVAILABLE = exists('*nvim_open_win')
+let s:POPUP_WINDOW_AVAILABLE = exists('*popup_atcursor')
 
 function! s:AddPrefix(message) abort
     return '[LC] ' . a:message
@@ -119,10 +120,14 @@ endfunction
 function! s:useVirtualText() abort
     let l:use = s:GetVar('LanguageClient_useVirtualText')
     if l:use isnot v:null
-        return !!l:use
+        return l:use
     endif
 
-    return exists('*nvim_buf_set_virtual_text')
+    if exists('*nvim_buf_set_virtual_text')
+        return 'All'
+    else
+        return 'No'
+    endif
 endfunction
 
 function! s:IsTrue(v) abort
@@ -277,8 +282,8 @@ function! s:GetVar(...) abort
 endfunction
 
 function! s:ShouldUseFloatWindow() abort
-    let use = s:GetVar('LanguageClient_useFloatingHover')
-    return s:FLOAT_WINDOW_AVAILABLE && (use || use is v:null)
+    let floatingHoverEnabled = s:GetVar('LanguageClient_useFloatingHover', v:true)
+    return s:FLOAT_WINDOW_AVAILABLE && floatingHoverEnabled
 endfunction
 
 function! s:CloseFloatingHover() abort
@@ -330,14 +335,23 @@ endfunction
 
 " Open preview window. Window is open in:
 "   - Floating window on Neovim (0.4.0 or later)
+"   - popup window on vim (8.2 or later)
 "   - Preview window on Neovim (0.3.0 or earlier) or Vim
 function! s:OpenHoverPreview(bufname, lines, filetype) abort
     " Use local variable since parameter is not modifiable
     let lines = a:lines
     let bufnr = bufnr('%')
 
-    let use_float_win = s:ShouldUseFloatWindow()
-    if use_float_win
+    let display_approach = ''
+    if s:ShouldUseFloatWindow()
+        let display_approach = 'float_win'
+    elseif s:POPUP_WINDOW_AVAILABLE && s:GetVar('LanguageClient_usePopupHover', v:true)
+        let display_approach = 'popup_win'
+    else
+        let display_approach = 'preview'
+    endif
+
+    if display_approach ==# 'float_win'
         " When a language server takes a while to initialize and the user
         " calls hover multiple times during that time (for example, via an
         " automatic hover on cursor move setup), we will get a number of
@@ -400,23 +414,30 @@ function! s:OpenHoverPreview(bufname, lines, filetype) abort
         execute 'noswapfile edit!' a:bufname
 
         setlocal winhl=Normal:CursorLine
-    else
+    elseif display_approach ==# 'popup_win'
+        let pop_win_id = popup_atcursor(a:lines, {})
+        call setbufvar(winbufnr(pop_win_id), '&filetype', a:filetype)
+    elseif display_approach ==# 'preview'
         execute 'silent! noswapfile pedit!' a:bufname
         wincmd P
+    else
+        call s:Echoerr('Unknown display approach: ' . display_approach)
     endif
 
-    setlocal buftype=nofile nobuflisted bufhidden=wipe nonumber norelativenumber signcolumn=no modifiable
+    if display_approach !=# 'popup_win'
+        setlocal buftype=nofile nobuflisted bufhidden=wipe nonumber norelativenumber signcolumn=no modifiable
 
-    if a:filetype isnot v:null
-        let &filetype = a:filetype
+        if a:filetype isnot v:null
+            let &filetype = a:filetype
+        endif
+
+        call setline(1, lines)
+        setlocal nomodified nomodifiable
+
+        wincmd p
     endif
 
-    call setline(1, lines)
-    setlocal nomodified nomodifiable
-
-    wincmd p
-
-    if use_float_win
+    if display_approach ==# 'float_win'
         " Unlike preview window, :pclose does not close window. Instead, close
         " hover window automatically when cursor is moved.
         let call_after_move = printf('<SID>CloseFloatingHoverOnCursorMove(%s)', string(pos))
@@ -825,11 +846,23 @@ function! LanguageClient#workspace_symbol(...) abort
     return LanguageClient#Call('workspace/symbol', l:params, l:Callback)
 endfunction
 
-function! LanguageClient#textDocument_codeAction(...) abort
+function! LanguageClient#textDocument_codeLens(...) abort
     let l:Callback = get(a:000, 1, v:null)
     let l:params = {
                 \ 'filename': LSP#filename(),
                 \ 'text': LSP#text(),
+                \ 'line': LSP#line(),
+                \ 'character': LSP#character(),
+                \ 'handle': s:IsFalse(l:Callback),
+                \ }
+    call extend(l:params, get(a:000, 0, {}))
+    return LanguageClient#Call('textDocument/codeLens', l:params, l:Callback)
+endfunction
+
+function! LanguageClient#textDocument_codeAction(...) abort
+    let l:Callback = get(a:000, 1, v:null)
+    let l:params = {
+                \ 'filename': LSP#filename(),
                 \ 'line': LSP#line(),
                 \ 'character': LSP#character(),
                 \ 'handle': s:IsFalse(l:Callback),
@@ -1300,6 +1333,17 @@ function! LanguageClient#java_classFileContents(...) abort
     let l:params = get(a:000, 0, {})
     let l:Callback = get(a:000, 1, v:null)
     return LanguageClient#Call('java/classFileContents', l:params, l:Callback)
+endfunction
+
+function! LanguageClient#handleCodeLensAction(...) abort
+    let l:Callback = get(a:000, 1, v:null)
+    let l:params = {
+                \ 'filename': LSP#filename(),
+                \ 'line': LSP#line(),
+                \ 'character': LSP#character(),
+                \ }
+    call extend(l:params, get(a:000, 0, {}))
+    return LanguageClient#Call('LanguageClient/handleCodeLensAction', l:params, l:Callback)
 endfunction
 
 function! LanguageClient_contextMenuItems() abort

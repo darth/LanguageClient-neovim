@@ -344,17 +344,29 @@ Default: >
 
 Specify whether to use virtual text to display diagnostics.
 
-Default: 1 whenever virtual text is supported.
-Valid Options: 1 | 0
+Default: "All" whenever virtual text is supported.
+Valid Options: "All" | "No" | "CodeLens" | "Diagnostics"
 
 2.26 g:LanguageClient_useFloatingHover *g:LanguageClient_useFloatingHover*
 
 When the value is set to 1, |LanguageClient#textDocument_hover()| opens
 documentation in a floating window instead of preview.
 This variable is effective only when the floating window feature is
-supported.
+supported. Check by running >
+    :echomsg exists('nvim_open_win')
 
 Default: 1 when a floating window is supported, otherwise 0
+Valid Options: 1 | 0
+
+2.26 g:LanguageClient_usePopupHover           *g:LanguageClient_usePopupHover*
+
+When the value is set to 1, |LanguageClient#textDocument_hover()| opens
+documentation in a popup window instead of preview.
+This variable is effective only when the popup window feature is
+supported, which is supported only in vim 8.2+. Check by running >
+    :echomsg has('popupwin')
+
+Default: 1 when a popup window is supported, otherwise 0
 Valid Options: 1 | 0
 
 2.27 g:LanguageClient_virtualTextPrefix     *g:LanguageClient_virtualTextPrefix*
@@ -476,6 +488,19 @@ Example bindings combining with tpope/vim-abolish:
     noremap <leader>ru :call LanguageClient#textDocument_rename(
                 \ {'newName': Abolish.uppercase(expand('<cword>'))})<CR>
 <
+
+*LanguageClient#textDocument_codeLens()*
+*LanguageClient_textDocument_codeLens()*
+Signature: LanguageClient#textDocument_codeLens(...)
+
+Computes and displays the codeLens for the currently open file.
+
+*LanguageClient#textDocument_codeLensAction()*
+*LanguageClient_textDocument_codeLensAction()*
+Signature: LanguageClient#textDocument_codeLensAction(...)
+
+Runs the action associated with the codeLens at the current line. It does
+nothing if the codeLens is not actionable.
 
 *LanguageClient#textDocument_documentSymbol()*
 *LanguageClient_textDocument_documentSymbol()*
