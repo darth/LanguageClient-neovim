@@ -1796,26 +1796,35 @@ impl LanguageClient {
         let filename = self.vim()?.get_filename(params)?;
         let line = self.vim()?.get_position(params)?.line;
 
-        let mut code_lens: Vec<CodeLens> =
-            self.get(|state| state.code_lens.get(filename.as_str()).cloned().unwrap())?;
-        code_lens.retain(|cl| cl.range.start.line == line);
+        let code_lens: Vec<CodeLens> = self.get(|state| {
+            state
+                .code_lens
+                .get(&filename)
+                .cloned()
+                .unwrap_or_else(Vec::new)
+                .into_iter()
+                .filter(|action| action.range.start.line == line)
+                .collect()
+        })?;
         if code_lens.is_empty() {
             warn!("No actions associated with this codeLens");
             return Ok(Value::Null);
         }
 
         if code_lens.len() > 1 {
-            warn!("Mulitple actions associated with this codeLens");
+            warn!("Multiple actions associated with this codeLens");
             return Ok(Value::Null);
         }
 
-        if let Some(command) = code_lens.pop().unwrap().command {
-            if !self.try_handle_command_by_client(&command)? {
-                let params = json!({
-                "command": command.command,
-                "arguments": command.arguments,
-                });
-                self.workspace_executeCommand(&params)?;
+        if let Some(code_lens_action) = code_lens.get(0) {
+            if let Some(command) = &code_lens_action.command {
+                if !self.try_handle_command_by_client(&command)? {
+                    let params = json!({
+                    "command": command.command,
+                    "arguments": command.arguments,
+                    });
+                    self.workspace_executeCommand(&params)?;
+                }
             }
         }
 
@@ -1829,41 +1838,67 @@ impl LanguageClient {
             return Ok(Value::Null);
         }
 
-        info!("Begin {}", lsp::request::CodeLensRequest::METHOD);
         let filename = self.vim()?.get_filename(params)?;
         let language_id = self.vim()?.get_languageId(&filename, params)?;
-        let client = self.get_client(&Some(language_id))?;
-        let input = lsp::CodeLensParams {
-            text_document: TextDocumentIdentifier {
-                uri: filename.to_url()?,
-            },
-        };
+        let capabilities = self.get(|state| state.capabilities.clone())?;
+        if let Some(initialize_result) = capabilities.get(&language_id) {
+            // XXX: the capabilities state field stores the initialize result, not the capabilities
+            // themselves, so we need to deserialize to InitializeResult.
+            let initialize_result: InitializeResult =
+                serde_json::from_value(initialize_result.clone())?;
+            let capabilities = initialize_result.capabilities;
+            if let Some(code_lens_provider) = capabilities.code_lens_provider {
+                info!("Begin {}", lsp::request::CodeLensRequest::METHOD);
+                let client = self.get_client(&Some(language_id))?;
+                let input = lsp::CodeLensParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: filename.to_url()?,
+                    },
+                };
 
-        let results: Value = client.call(lsp::request::CodeLensRequest::METHOD, &input)?;
+                let results: Value = client.call(lsp::request::CodeLensRequest::METHOD, &input)?;
+                let code_lens: Option<Vec<CodeLens>> = serde_json::from_value(results.clone())?;
 
-        let code_lens: Option<Vec<CodeLens>> = serde_json::from_value(results.clone())?;
-        let mut resolved_code_lens = vec![];
-        if let Some(code_lens) = code_lens {
-            for item in code_lens {
-                let mut item = item;
-                if let Some(_d) = &item.data {
-                    if let Some(cl) = client.call(lsp::request::CodeLensResolve::METHOD, &item)? {
-                        item = cl;
+                if code_lens_provider.resolve_provider.is_some() {
+                    let mut resolved_code_lens = vec![];
+                    if let Some(code_lens) = code_lens {
+                        for item in code_lens {
+                            let mut item = item;
+                            if let Some(_d) = &item.data {
+                                if let Some(cl) =
+                                    client.call(lsp::request::CodeLensResolve::METHOD, &item)?
+                                {
+                                    item = cl;
+                                }
+                            }
+                            resolved_code_lens.push(item);
+                        }
                     }
+
+                    self.update(|state| {
+                        state
+                            .code_lens
+                            .insert(filename.to_owned(), resolved_code_lens);
+                        Ok(Value::Null)
+                    })?;
+                } else if let Some(code_lens) = code_lens {
+                    self.update(|state| {
+                        state.code_lens.insert(filename.to_owned(), code_lens);
+                        Ok(Value::Null)
+                    })?;
                 }
-                resolved_code_lens.push(item);
+
+                info!("End {}", lsp::request::CodeLensRequest::METHOD);
+                return Ok(results);
+            } else {
+                info!(
+                    "CodeLens not supported. Skipping {}",
+                    lsp::request::CodeLensRequest::METHOD
+                );
             }
         }
 
-        self.update(|state| {
-            state
-                .code_lens
-                .insert(filename.to_owned(), resolved_code_lens);
-            Ok(Value::Null)
-        })?;
-
-        info!("End {}", lsp::request::CodeLensRequest::METHOD);
-        Ok(results)
+        Ok(Value::Null)
     }
 
     pub fn textDocument_didOpen(&self, params: &Value) -> Fallible<()> {
@@ -2315,18 +2350,10 @@ impl LanguageClient {
         let result = self.textDocument_completion(params)?;
         let result: Option<CompletionResponse> = serde_json::from_value(result)?;
         let result = result.unwrap_or_else(|| CompletionResponse::Array(vec![]));
-        let mut matches = match result {
+        let matches = match result {
             CompletionResponse::Array(arr) => arr,
             CompletionResponse::List(list) => list.items,
         };
-        if !matches.iter().any(|m| m.sort_text.is_none()) {
-            matches.sort_by(|m1, m2| {
-                m1.sort_text
-                    .as_ref()
-                    .unwrap()
-                    .cmp(m2.sort_text.as_ref().unwrap())
-            });
-        }
 
         let complete_position: Option<u64> = try_get("complete_position", params)?;
 
@@ -2516,49 +2543,47 @@ impl LanguageClient {
                 .map(|(line, severity)| Sign::new(line, format!("LanguageClient{:?}", severity)))
                 .collect())
         })?;
-        let signs_prev: Vec<_> = self.update(|state| {
-            Ok(state
+        self.update(|state| {
+            let signs_prev: Vec<_> = state
                 .signs
                 .entry(filename.clone())
                 .or_default()
                 .iter()
                 .map(|(_, sign)| sign.clone())
-                .collect())
-        })?;
-        let mut signs_to_add = vec![];
-        let mut signs_to_delete = vec![];
-        let diffs = diff::slice(&signs_next, &signs_prev);
-        for diff in diffs {
-            match diff {
-                diff::Result::Left(s) => {
-                    signs_to_add.push(s.clone());
+                .collect();
+            let mut signs_to_add = vec![];
+            let mut signs_to_delete = vec![];
+            let diffs = diff::slice(&signs_next, &signs_prev);
+            for diff in diffs {
+                match diff {
+                    diff::Result::Left(s) => {
+                        signs_to_add.push(s.clone());
+                    }
+                    diff::Result::Right(s) => {
+                        signs_to_delete.push(s.clone());
+                    }
+                    _ => {}
                 }
-                diff::Result::Right(s) => {
-                    signs_to_delete.push(s.clone());
-                }
-                _ => {}
             }
-        }
-        for sign in &mut signs_to_add {
-            if sign.id == 0 {
-                sign.id = self.update(|state| {
+            for sign in &mut signs_to_add {
+                if sign.id == 0 {
                     state.sign_next_id += 1;
-                    Ok(state.sign_next_id)
-                })?;
+                    sign.id = state.sign_next_id;
+                }
             }
-        }
-        self.vim()?
-            .set_signs(&filename, &signs_to_add, &signs_to_delete)?;
-        self.update(|state| {
+
             let signs = state.signs.entry(filename.clone()).or_default();
             // signs might be deleted AND added in the same line to change severity,
             // so deletions must be before additions
-            for sign in signs_to_delete {
+            for sign in &signs_to_delete {
                 signs.remove(&sign.line);
             }
-            for sign in signs_to_add {
-                signs.insert(sign.line, sign);
+            for sign in &signs_to_add {
+                signs.insert(sign.line, sign.clone());
             }
+            state
+                .vim
+                .set_signs(&filename, &signs_to_add, &signs_to_delete)?;
             Ok(())
         })?;
 
