@@ -2,6 +2,10 @@ if !exists('g:LanguageClient_serverCommands')
     let g:LanguageClient_serverCommands = {}
 endif
 
+if !exists('g:LanguageClient_semanticHighlightMaps')
+    let g:LanguageClient_semanticHighlightMaps = {}
+endif
+
 function! LanguageClient_textDocument_hover(...)
     return call('LanguageClient#textDocument_hover', a:000)
 endfunction
@@ -94,8 +98,16 @@ function! LanguageClient_serverStatusMessage(...)
     return call('LanguageClient#serverStatusMessage', a:000)
 endfunction
 
+function! LanguageClient_isServerRunning(...)
+    return call('LanguageClient#isServerRunning', a:000)
+endfunction
+
 function! LanguageClient_statusLine(...)
     return call('LanguageClient#statusLine', a:000)
+endfunction
+
+function! LanguageClient_statusLineDiagnosticsCounts(...)
+    return call('LanguageClient#statusLineDiagnosticsCounts', a:000)
 endfunction
 
 function! LanguageClient_clearDocumentHighlight(...)
@@ -121,6 +133,7 @@ augroup languageClient
     autocmd!
     autocmd FileType * call LanguageClient#handleFileType()
     autocmd BufNewFile * call LanguageClient#handleBufNewFile()
+    autocmd BufEnter * call LanguageClient#handleBufEnter()
     autocmd BufWritePost * call LanguageClient#handleBufWritePost()
     autocmd BufDelete * call LanguageClient#handleBufDelete()
     autocmd TextChanged * call LanguageClient#handleTextChanged()

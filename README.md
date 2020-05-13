@@ -1,6 +1,7 @@
 > For legacy python implementation, see [branch master](https://github.com/autozimu/LanguageClient-neovim/tree/master).
 
 # LanguageClient-neovim
+
 [![CircleCI](https://circleci.com/gh/autozimu/LanguageClient-neovim.svg?style=svg)](https://circleci.com/gh/autozimu/LanguageClient-neovim)
 
 [Language Server Protocol] (LSP) support for [vim] and [neovim].
@@ -74,7 +75,7 @@ language services will be available right away. Happy hacking!
 
 # Troubleshooting
 
-[Troubleshooting](INSTALL.md#6-troubleshooting)
+[Troubleshooting](INSTALL.md#troubleshooting)
 
 # Language Servers
 
@@ -90,6 +91,7 @@ to install them, please see <http://langserver.org> and/or
 [LanguageClient.txt]: doc/LanguageClient.txt
 
 # Changelog
+
 See [Updates]. Subscribe the issue if you want to receive notifications.
 
 [Updates]: https://github.com/autozimu/LanguageClient-neovim/issues/35

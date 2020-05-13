@@ -202,8 +202,10 @@ Valid options: "Error" | "Warning" | "Info" | "Log"
 
 2.12 g:LanguageClient_settingsPath              *g:LanguageClient_settingsPath*
 
-Path for language server settings. If not an absolute path this is relative
-to the workspace directory.
+Path for language server settings, or list of such paths. If not an absolute
+path this is relative to the workspace directory. If several paths are
+provided, then the corresponding settings are merged with precedence going to
+the last file.
 
 Example settings file content: >
     {
@@ -358,7 +360,13 @@ supported. Check by running >
 Default: 1 when a floating window is supported, otherwise 0
 Valid Options: 1 | 0
 
-2.26 g:LanguageClient_usePopupHover           *g:LanguageClient_usePopupHover*
+2.27 g:LanguageClient_floatingHoverHighlight *g:LanguageClient_floatingHoverHighlight*
+
+Control how floating window hover highlights are displayed.
+
+Default: Normal:CursorLine
+
+2.28 g:LanguageClient_usePopupHover           *g:LanguageClient_usePopupHover*
 
 When the value is set to 1, |LanguageClient#textDocument_hover()| opens
 documentation in a popup window instead of preview.
@@ -369,7 +377,7 @@ supported, which is supported only in vim 8.2+. Check by running >
 Default: 1 when a popup window is supported, otherwise 0
 Valid Options: 1 | 0
 
-2.27 g:LanguageClient_virtualTextPrefix     *g:LanguageClient_virtualTextPrefix*
+2.29 g:LanguageClient_virtualTextPrefix     *g:LanguageClient_virtualTextPrefix*
 
 When the value is set to a valid string and |g:LanguageClient_useVirtualText| is
 enabled, all virtual text lines are prefixed with the defined string.
@@ -379,20 +387,160 @@ supported.
 Default: Empty string ('')
 Valid Options: string
 
-2.28 g:LanguageClient_diagnosticsMaxSeverity  *g:LanguageClient_diagnosticsMaxSeverity*
+2.30 g:LanguageClient_diagnosticsMaxSeverity  *g:LanguageClient_diagnosticsMaxSeverity*
 
 Maximum severity to show diagnostic messages.
 
 Default: "Hint"
 Valid options: "Error" | "Warning" | "Information" | "Hint"
 
-2.29 g:LanguageClient_echoProjectRoot  *g:LanguageClient_echoProjectRoot*
+2.31 g:LanguageClient_echoProjectRoot  *g:LanguageClient_echoProjectRoot*
 
 Whether to echo messages in vim of the form: "Project root: /home/user/myproject" when
 the root of a project is detected using g:LanguageClient_rootMarkers.
 
 Default: 1 to display the messages
 Valid options: 1 | 0
+
+2.32 g:LanguageClient_semanticHighlightMaps   *g:LanguageClient_semanticHighlightMaps*
+
+String to list/map map. Defines the mapping of semantic highlighting "scopes" to
+highlight groups. This depends on the LSP server supporting the proposed
+semantic highlighting protocol, see:
+
+https://github.com/microsoft/language-server-protocol/issues/18
+https://github.com/microsoft/vscode-languageserver-node/issues/368
+
+
+Like |g:LanguageClient_serverCommands| this is a map where the keys are
+filetypes. However each submap has |regexp| keys and highlight group names
+as values (see |highlight-groups|).
+>
+    let g:LanguageClient_semanticHighlightMaps = {
+        \ 'java': {
+        \   '^entity.name.function.java': 'Function',
+        \   '^entity.name.type.class.java': 'Type',
+        \   '^[^:]*entity.name.function.java': 'Function',
+        \   '^[^:]entity.name.type.class.java': 'Type'
+        \ }
+        \ }
+
+The |regexp| in the keys will be used to match semantic scopes. Then any symbols
+that have a semantic scope that matches the key will be highlighted with the
+associated highlight group value. Currently there is no defined order if a
+semantic scope can match multiple keys, so it is recommended to make the keys
+more specific to only match the desired scope(s).
+
+There are a fixed set of semantic scopes defined by the LSP server on startup.
+These can be viewed by calling |LanguageClient_showSemanticScopes| which will
+show all the semantic scopes and their currently mapped highlight group for
+the currently open buffer's filetype.
+>
+     call LanguageClient_showSemanticScopes()
+
+     == Output from eclipse.jdt.ls ==
+
+     Highlight Group:
+      None
+     Semantic Scope:
+      invalid.deprecated.java
+       meta.class.java
+        source.java
+
+     Highlight Group:
+      None
+     Semantic Scope:
+      variable.other.autoboxing.java
+       meta.method.body.java
+        meta.method.java
+         meta.class.body.java
+          meta.class.java
+           source.java
+
+     ...
+
+Each semantic scope is a list of strings. They are printed with increasing
+indent to make it easier to read. For example the first scope is:
+>
+     ['invalid.deprecated.java', 'meta.class.java', 'source.java']
+
+It is currently isn't mapped to any highlight group as indicated by the None.
+
+Often its more useful to find what semantic scope corresponds to a piece of
+text. This can be done by calling |LanguageClient_showCursorSemanticHighlightSymbols|
+while hovering over the text of interest.
+>
+     call LanguageClient_showCursorSemanticHighlightSymbols()
+
+When matching the semantic scopes to keys in |LanguageClient_semanticHighlightMaps|,
+the scopes are concatentated using |LanguageClient_semanticScopeSeparator|
+which is set to the string |':'| by default. For the previous example the
+semantic scope would have this string form using the default separator:
+>
+     invalid.deprecated.java:meta.class.java:source.java
+
+Here are a couple of example |regexp| keys that can/cannot match this scope:
+>
+     'meta.class.java' =~ 'invalid.deprecated.java:meta.class.java:source.java'
+     '^meta.class.java' !~ 'invalid.deprecated.java:meta.class.java:source.java'
+     '^invalid.deprecated.java' =~ 'invalid.deprecated.java:meta.class.java:source.java'
+     'source.java$' =~ 'invalid.deprecated.java:meta.class.java:source.java'
+     'meta.class.java:source.java' =~ 'invalid.deprecated.java:meta.class.java:source.java'
+     'invalid.deprecated.java:.*:source.java' =~ 'invalid.deprecated.java:meta.class.java:source.java'
+
+Example configuration for eclipse.jdt.ls:
+>
+     let g:LanguageClient_semanticHighlightMaps = {}
+     let g:LanguageClient_semanticHighlightMaps['java'] = {
+       \ '^storage.modifier.static.java:entity.name.function.java': 'JavaStaticMemberFunction',
+       \ '^meta.definition.variable.java:meta.class.body.java:meta.class.java': 'JavaMemberVariable',
+       \ '^entity.name.function.java': 'Function',
+       \ '^[^:]*entity.name.function.java': 'Function',
+       \ '^[^:]*entity.name.type.class.java': 'Type',
+       \ }
+
+     highlight! JavaStaticMemberFunction ctermfg=Green cterm=none guifg=Green gui=none
+     highlight! JavaMemberVariable ctermfg=White cterm=italic guifg=White gui=italic
+
+
+2.33 g:LanguageClient_applyCompletionAdditionalTextEdits *g:LanguageClient__applyCompletionAdditionalTextEdits*
+
+Indicates whether completionItem additional text edits should be applied.
+
+Default: 1
+Valid options: 1 | 0
+
+2.34 g:LanguageClient_preferredMarkupKind *g:LanguageClient_preferredMarkupKind*
+
+Sets the preferred markup kind. This value is sent to the server and is
+normally used to decide whether to send plaintext or markdown in things like
+hover or completion items docunmentation.
+
+This should be set to an array of values with the preferred markup kinds in
+order of preferrence. Leaving this config unset, will send `null` to the
+server, effectively letting it decide which markup kind to use.
+
+Example setting 1. Set the preferred markup kind to `plaintext`
+  ```
+  let g:LanguageClient_preferredMarkupKind: ['plaintext']
+  ```
+
+Example setting 2. Set the preferred markup kind to `plaintext` and `markdown`
+as a fallback.
+
+  ```
+  let g:LanguageClient_preferredMarkupKind: ['plaintext', 'markdown']
+  ```
+
+Example setting 3. Set the preferred markup kind to `markdown`
+
+  ```
+  let g:LanguageClient_preferredMarkupKind: ['markdown']
+
+This setting may have no effect of the server decides not to honour it.
+
+Default: v:null
+Valid options: Array<String>
 
 ==============================================================================
 3. Commands                                           *LanguageClientCommands*
@@ -643,11 +791,34 @@ Signature: LanguageClient#serverStatusMessage()
 
 Get a detail message of server status.
 
+*LanguageClient#isServerRunning()*
+*LanguageClient_isServerRunning()*
+Signature: LanguageClient#isServerRunning()
+
+Get wheter if language server is running for current buffer. 0 for server not working for current buffer file
+type. 1 for working.
+
 *LanguageClient#statusLine()*
 *LanguageClient_statusLine()*
 Signature: LanguageClient#statusLine()
 
 Example status line making use of |LanguageClient_serverStatusMessage|.
+
+*LanguageClient#statusLineDiagnosticsCounts()*
+*LanguageClient_statusLineDiagnosticsCounts()*
+Signature: LanguageClient#statusLineDiagnosticsCounts()
+
+Get diagnostics of current buffer in dictionary.
+
+Example >
+    function! YourStatusLineMessage() abort
+      let l:diagnosticsDict = LanguageClient#statusLineDiagnosticsCounts()
+      let l:errors = get(l:diagnosticsDict,'E',0)
+      let l:warnings = get(l:diagnosticsDict,'W',0)
+      let l:informations = get(l:diagnosticsDict,'I',0)
+      let l:hints = get(l:diagnosticsDict,'H',0)
+      return l:errors + l:warnings + l:informations + l:hints == 0 ? "✔ " : "E:" . l:errors . " " . "W :" . l:warnings . "I:" . l:informations . " " . "H:" . l:hints
+    endfunction
 
 *LanguageClient#cquery_base*
 *LanguageClient_cquery_base*
@@ -671,6 +842,18 @@ Call $cquery/vars.
 Signature: LanguageClient#java_classFileContents(...)
 
 Call java/classFileContents.
+
+*LanguageClient_showSemanticScopes*
+Signature: LanguageClient_showSemanticScopes(...)
+
+Get all Semantic Scopes and their associated highlight groups for the current
+filetype (filetype of the currently open buffer) and print them.
+
+*LanguageClient_showCursorSemanticHighlightSymbols*
+Signature: LanguageClient_showCursorSemanticHighlightSymbols(...)
+
+Get the Semantic Scope of the symbol currently under the cursor.
+The result gets displayed in a popup.
 
 *LanguageClient#explainErrorAtPoint*
 Signature: LanguageClient#explainErrorAtPoint(...)

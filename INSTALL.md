@@ -1,12 +1,31 @@
-# 1. Requirements
+# Requirements
+
 - neovim or
 - vim >= 8.0
 
-# 2. Install dependencies
+# Install dependencies
 
 None.
 
-# 3. Install this plugin
+# Install this plugin
+
+## Linux
+
+Packages are available for the following distributions:
+
+### Arch Linux
+
+There are two packages available on the [AUR][archlinux/aur]
+
+- [`aur/languageclient-neovim`][archlinux/install/aur]
+- [`aur/languageclient-neovim-bin`][archlinux/install/aur-bin]
+
+[archlinux/aur]: https://wiki.archlinux.org/index.php/Arch_User_Repository
+[archlinux/install/aur]: https://aur.archlinux.org/packages/languageclient-neovim
+[archlinux/install/aur-bin]: https://aur.archlinux.org/packages/languageclient-neovim-bin
+
+
+## With a plugin manager
 
 > For Windows users, replace `bash install.sh` with `powershell -executionpolicy bypass -File install.ps1` in following
 > snippets.
@@ -17,10 +36,10 @@ None.
 
 > Android is not supported using the `install.sh` script.
 
-Choose steps matching your plugin manager.
-
 ## [vim-plug](https://github.com/junegunn/vim-plug) user
+
 Add following to vimrc
+
 ```vim
 Plug 'autozimu/LanguageClient-neovim', {
     \ 'branch': 'next',
@@ -31,7 +50,9 @@ Plug 'autozimu/LanguageClient-neovim', {
 Restart neovim and run `:PlugInstall` to install.
 
 ## [dein.vim](https://github.com/Shougo/dein.vim) user
+
 Add following to vimrc
+
 ```vim
 call dein#add('autozimu/LanguageClient-neovim', {
     \ 'rev': 'next',
@@ -42,7 +63,9 @@ call dein#add('autozimu/LanguageClient-neovim', {
 Restart neovim and run `:call dein#install()` to install.
 
 ## Manual
+
 Clone this repo into some place, e.g., `~/.vim-plugins`
+
 ```sh
 mkdir -p ~/.vim-plugins
 cd ~/.vim-plugins
@@ -52,18 +75,22 @@ bash install.sh
 ```
 
 Add this plugin to vim/neovim `runtimepath`,
+
 ```vim
 set runtimepath+=~/.vim-plugins/LanguageClient-neovim
 ```
 
-# 4. Install language servers
+# Install language servers
+
 Install language servers if corresponding language servers are not available
 yet on your system. Please see <http://langserver.org> and/or
 <https://github.com/Microsoft/language-server-protocol/wiki/Protocol-Implementations>
 for list of language servers.
 
-# 5. Configure this plugin
+# Configure this plugin
+
 Example configuration
+
 ```vim
 " Required for operations modifying multiple buffers like rename.
 set hidden
@@ -81,12 +108,13 @@ nnoremap <silent> gd :call LanguageClient#textDocument_definition()<CR>
 nnoremap <silent> <F2> :call LanguageClient#textDocument_rename()<CR>
 ```
 
-# 6. Troubleshooting
+# Troubleshooting
 
-1. Backup your vimrc and use [min-vimrc.vim](min-vimrc.vim) as vimrc.
-1. Try on [sample projects](tests/data).
-1. Execute `:echo &runtimepath` and make sure the plugin path is in the list.
-1. Make sure language server could be started when invoked manually from shell.
- Also try use absolute path for server commands, as PATH in vim might be different from shell env, especially on macOS.
-1. Check content of log file. Also worth noting language server might have
-   separate log file.
+- Backup your vimrc and use [min-vimrc.vim](min-vimrc.vim) as vimrc.
+- Try on [sample projects](tests/data).
+- Execute `:echo &runtimepath` and make sure the plugin path is in the list.
+- Make sure language server could be started when invoked manually from shell.
+  Also try use absolute path for server commands, as PATH in vim might be
+  different from shell env, especially on macOS.
+- Check content of log file. Also worth noting language server might have
+  separate log file.

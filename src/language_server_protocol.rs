@@ -5,7 +5,6 @@ use crate::lsp::notification::Notification;
 use crate::lsp::request::GotoDefinitionResponse;
 use crate::lsp::request::Request;
 use crate::rpcclient::RpcClient;
-use crate::sign::Sign;
 use failure::err_msg;
 use itertools::Itertools;
 use notify::Watcher;
@@ -13,7 +12,7 @@ use std::sync::mpsc;
 use vim::try_get;
 
 impl LanguageClient {
-    pub fn get_client(&self, lang_id: &LanguageId) -> Fallible<RpcClient> {
+    pub fn get_client(&self, lang_id: &LanguageId) -> Fallible<Arc<RpcClient>> {
         self.get(|state| state.clients.get(lang_id).cloned())?
             .ok_or_else(|| {
                 LCError::ServerNotRunning {
@@ -26,6 +25,7 @@ impl LanguageClient {
     pub fn loop_call(&self, rx: &crossbeam::channel::Receiver<Call>) -> Fallible<()> {
         for call in rx.iter() {
             let language_client = LanguageClient {
+                version: self.version.clone(),
                 state_mutex: self.state_mutex.clone(),
                 clients_mutex: self.clients_mutex.clone(), // not sure if useful to clone this
             };
@@ -43,7 +43,7 @@ impl LanguageClient {
     fn sync_settings(&self) -> Fallible<()> {
         info!("Begin sync settings");
         let (loggingFile, loggingLevel, serverStderr): (
-            Option<String>,
+            Option<PathBuf>,
             log::LevelFilter,
             Option<String>,
         ) = self.vim()?.eval(
@@ -54,7 +54,7 @@ impl LanguageClient {
             ]
             .as_ref(),
         )?;
-        self.update(|state| logger::update_settings(&state.logger, &loggingFile, loggingLevel))?;
+        self.update(|state| state.logger.update_settings(loggingLevel, loggingFile))?;
 
         #[allow(clippy::type_complexity)]
         let (
@@ -79,7 +79,7 @@ impl LanguageClient {
             HashMap<String, Vec<String>>,
             Option<String>,
             Option<String>,
-            String,
+            Vec<String>,
             u64,
             Option<RootMarkers>,
             Option<f64>,
@@ -97,7 +97,7 @@ impl LanguageClient {
                 "s:GetVar('LanguageClient_serverCommands', {})",
                 "get(g:, 'LanguageClient_selectionUI', v:null)",
                 "get(g:, 'LanguageClient_trace', v:null)",
-                "expand(get(g:, 'LanguageClient_settingsPath', '.vim/settings.json'))",
+                "map(s:ToList(get(g:, 'LanguageClient_settingsPath', '.vim/settings.json')), 'expand(v:val)')",
                 "!!get(g:, 'LanguageClient_loadSettings', 1)",
                 "get(g:, 'LanguageClient_rootMarkers', v:null)",
                 "get(g:, 'LanguageClient_changeThrottle', v:null)",
@@ -113,6 +113,7 @@ impl LanguageClient {
             .as_ref(),
         )?;
 
+        #[allow(clippy::type_complexity)]
         let (
             diagnosticsSignsMax,
             diagnostics_max_severity,
@@ -120,7 +121,22 @@ impl LanguageClient {
             selectionUI_autoOpen,
             use_virtual_text,
             echo_project_root,
-        ): (Option<u64>, String, Value, u8, UseVirtualText, u8) = self.vim()?.eval(
+            semanticHighlightMaps,
+            semanticScopeSeparator,
+            applyCompletionAdditionalTextEdits,
+            preferred_markup_kind,
+        ): (
+            Option<usize>,
+            String,
+            Value,
+            u8,
+            UseVirtualText,
+            u8,
+            HashMap<String, HashMap<String, String>>,
+            String,
+            u8,
+            Option<Vec<MarkupKind>>,
+        ) = self.vim()?.eval(
             [
                 "get(g:, 'LanguageClient_diagnosticsSignsMax', v:null)",
                 "get(g:, 'LanguageClient_diagnosticsMaxSeverity', 'Hint')",
@@ -128,6 +144,10 @@ impl LanguageClient {
                 "!!s:GetVar('LanguageClient_selectionUI_autoOpen', 1)",
                 "s:useVirtualText()",
                 "!!s:GetVar('LanguageClient_echoProjectRoot', 1)",
+                "s:GetVar('LanguageClient_semanticHighlightMaps', {})",
+                "s:GetVar('LanguageClient_semanticScopeSeparator', ':')",
+                "get(g:, 'LanguageClient_applyCompletionAdditionalTextEdits', 1)",
+                "get(g:, 'LanguageClient_preferredMarkupKind', v:null)",
             ]
             .as_ref(),
         )?;
@@ -186,6 +206,7 @@ impl LanguageClient {
         };
 
         let completionPreferTextEdit = completionPreferTextEdit == 1;
+        let applyCompletionAdditionalTextEdits = applyCompletionAdditionalTextEdits == 1;
 
         let is_nvim = is_nvim == 1;
 
@@ -201,8 +222,14 @@ impl LanguageClient {
             ),
         };
 
+        let semanticHlUpdateLanguageIds: Vec<String> =
+            semanticHighlightMaps.keys().cloned().collect();
+
         self.update(|state| {
             state.autoStart = autoStart;
+            state.semanticHighlightMaps = semanticHighlightMaps;
+            state.semanticScopeSeparator = semanticScopeSeparator;
+            state.semantic_scope_to_hl_group_table.clear();
             state.serverCommands.extend(serverCommands);
             state.selectionUI = selectionUI;
             state.selectionUI_autoOpen = selectionUI_autoOpen;
@@ -226,14 +253,18 @@ impl LanguageClient {
             state.wait_output_timeout = wait_output_timeout;
             state.hoverPreview = hoverPreview;
             state.completionPreferTextEdit = completionPreferTextEdit;
+            state.applyCompletionAdditionalTextEdits = applyCompletionAdditionalTextEdits;
             state.use_virtual_text = use_virtual_text;
             state.echo_project_root = echo_project_root == 1;
-            state.loggingFile = loggingFile;
-            state.loggingLevel = loggingLevel;
             state.serverStderr = serverStderr;
             state.is_nvim = is_nvim;
+            state.preferred_markup_kind = preferred_markup_kind;
             Ok(())
         })?;
+
+        for languageId in semanticHlUpdateLanguageIds {
+            self.updateSemanticHighlightTables(&languageId)?;
+        }
 
         info!("End sync settings");
         Ok(())
@@ -244,13 +275,39 @@ impl LanguageClient {
             return Ok(Value::Null);
         }
 
-        let path = Path::new(root).join(&self.get(|state| state.settingsPath.clone())?);
-        let buffer = read_to_string(&path).with_context(|err| {
-            format!("Failed to read file ({}): {}", path.to_string_lossy(), err)
-        })?;
-        let value = serde_json::from_str(&buffer)?;
-        let value = expand_json_path(value);
-        Ok(value)
+        let mut res = Value::Null;
+        let mut last_err = None;
+        let mut at_least_one_success = false;
+        for orig_path in self.get(|state| state.settingsPath.clone())? {
+            let path = Path::new(root).join(orig_path);
+            let buffer = read_to_string(&path).with_context(|err| {
+                format!("Failed to read file ({}): {}", path.to_string_lossy(), err)
+            });
+            let buffer = match buffer {
+                Err(e) => {
+                    last_err = Some(e.into());
+                    continue;
+                }
+                Ok(x) => x,
+            };
+            let value = serde_json::from_str(&buffer);
+            let value = match value {
+                Err(e) => {
+                    last_err = Some(e.into());
+                    continue;
+                }
+                Ok(x) => x,
+            };
+            let value = expand_json_path(value);
+            json_patch::merge(&mut res, &value);
+            at_least_one_success = true;
+        }
+
+        match last_err {
+            // no file was read and an error happened
+            Some(e) if !at_least_one_success => Err(e),
+            _ => Ok(res),
+        }
     }
 
     fn define_signs(&self) -> Fallible<()> {
@@ -279,14 +336,22 @@ impl LanguageClient {
             match changes {
                 DocumentChanges::Edits(ref changes) => {
                     for e in changes {
-                        self.apply_TextEdits(&e.text_document.uri.filepath()?, &e.edits)?;
+                        position = self.apply_TextEdits(
+                            &e.text_document.uri.filepath()?,
+                            &e.edits,
+                            position,
+                        )?;
                     }
                 }
                 DocumentChanges::Operations(ref ops) => {
                     for op in ops {
                         match op {
                             Edit(ref e) => {
-                                self.apply_TextEdits(&e.text_document.uri.filepath()?, &e.edits)?
+                                position = self.apply_TextEdits(
+                                    &e.text_document.uri.filepath()?,
+                                    &e.edits,
+                                    position,
+                                )?
                             }
                             Op(ref rop) => match rop {
                                 Create(file) => {
@@ -302,7 +367,7 @@ impl LanguageClient {
             }
         } else if let Some(ref changes) = edit.changes {
             for (uri, edits) in changes {
-                self.apply_TextEdits(&uri.filepath()?, edits)?;
+                position = self.apply_TextEdits(&uri.filepath()?, edits, position)?;
             }
         }
         self.edit(&None, &filename)?;
@@ -433,10 +498,15 @@ impl LanguageClient {
         Ok(())
     }
 
-    fn apply_TextEdits<P: AsRef<Path>>(&self, path: P, edits: &[TextEdit]) -> Fallible<()> {
+    fn apply_TextEdits<P: AsRef<Path>>(
+        &self,
+        path: P,
+        edits: &[TextEdit],
+        position: Position,
+    ) -> Fallible<Position> {
         debug!("Begin apply TextEdits: {:?}", edits);
         if edits.is_empty() {
-            return Ok(());
+            return Ok(position);
         }
 
         let mut edits = edits.to_vec();
@@ -459,7 +529,7 @@ impl LanguageClient {
             lines.push("".to_owned());
         }
 
-        let mut lines = apply_TextEdits(&lines, &edits)?;
+        let (mut lines, position) = apply_TextEdits(&lines, &edits, &position)?;
 
         if lines.last().map(String::is_empty) == Some(true) && fixendofline {
             lines.pop();
@@ -470,7 +540,7 @@ impl LanguageClient {
         }
         self.vim()?.rpcclient.notify("setline", json!([1, lines]))?;
         debug!("End apply TextEdits");
-        Ok(())
+        Ok(position)
     }
 
     fn update_quickfixlist(&self) -> Fallible<()> {
@@ -594,10 +664,7 @@ impl LanguageClient {
             let mut match_groups: HashMap<_, Vec<_>> = HashMap::new();
 
             for dn in diagnostics {
-                let severity = dn
-                    .severity
-                    .unwrap_or(DiagnosticSeverity::Information)
-                    .to_int()?;
+                let severity = dn.severity.unwrap_or(DiagnosticSeverity::Hint).to_int()?;
                 match_groups
                     .entry(severity)
                     .or_insert_with(Vec::new)
@@ -818,6 +885,81 @@ impl LanguageClient {
         Ok(())
     }
 
+    fn parseSemanticScopes(&self, languageId: &str, result: &Value) -> Fallible<()> {
+        info!("Begin parse Semantic Scopes");
+        let result: InitializeResult = serde_json::from_value(result.clone())?;
+
+        if let Some(capability) = result.capabilities.semantic_highlighting {
+            self.update(|state| {
+                state
+                    .semantic_scopes
+                    .insert(languageId.into(), capability.scopes.unwrap_or_default());
+                Ok(())
+            })?;
+        }
+
+        info!("End parse Semantic Scopes");
+        Ok(())
+    }
+
+    /// Build the Semantic Highlight Lookup Table of
+    ///
+    /// ScopeIndex -> Option<HighlightGroup>
+    fn updateSemanticHighlightTables(&self, languageId: &str) -> Fallible<()> {
+        info!("Begin updateSemanticHighlightTables");
+        let (opt_scopes, opt_hl_map, scopeSeparator) = self.get(|state| {
+            (
+                state.semantic_scopes.get(languageId).cloned(),
+                state.semanticHighlightMaps.get(languageId).cloned(),
+                state.semanticScopeSeparator.clone(),
+            )
+        })?;
+
+        if let (Some(semantic_scopes), Some(semanticHighlightMap)) = (opt_scopes, opt_hl_map) {
+            let mut table: Vec<Option<String>> = Vec::new();
+
+            for scope_list in semantic_scopes {
+                // Combine all scopes ["scopeA", "scopeB", ...] -> "scopeA:scopeB:..."
+                let scope_str = scope_list.iter().join(&scopeSeparator);
+
+                let mut matched = false;
+                for (scope_regex, hl_group) in &semanticHighlightMap {
+                    let match_expr = format!(
+                        "({} =~ {})",
+                        convert_to_vim_str(&scope_str),
+                        convert_to_vim_str(scope_regex)
+                    );
+
+                    let matches: i32 = self.vim()?.eval(match_expr)?;
+
+                    if matches == 1 {
+                        table.push(Some(hl_group.clone()));
+                        matched = true;
+                        break;
+                    }
+                }
+
+                if !matched {
+                    table.push(None);
+                }
+            }
+
+            self.update(|state| {
+                state
+                    .semantic_scope_to_hl_group_table
+                    .insert(languageId.into(), table);
+                Ok(())
+            })?;
+        } else {
+            self.update(|state| {
+                state.semantic_scope_to_hl_group_table.remove(languageId);
+                Ok(())
+            })?;
+        }
+        info!("End updateSemanticHighlightTables");
+        Ok(())
+    }
+
     fn get_line(&self, path: impl AsRef<Path>, line: u64) -> Fallible<String> {
         let value = self.vim()?.rpcclient.call(
             "getbufline",
@@ -844,6 +986,35 @@ impl LanguageClient {
                     for edit in edits {
                         let edit: WorkspaceEdit = serde_json::from_value(edit.clone())?;
                         self.apply_WorkspaceEdit(&edit)?;
+                    }
+                }
+            }
+            "rust-analyzer.showReferences" => {
+                let locations = cmd
+                    .arguments
+                    .clone()
+                    .unwrap_or_else(|| vec![])
+                    .get(2)
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(vec![]));
+                let locations: Vec<Location> = serde_json::from_value(locations)?;
+
+                self.display_locations(&locations, "References")?;
+            }
+            "rust-analyzer.selectAndApplySourceChange" => {
+                if let Some(ref edits) = cmd.arguments {
+                    for edit in edits {
+                        let workspace_edits: Vec<WorkspaceEditWithCursor> =
+                            serde_json::from_value(edit.clone())?;
+                        for edit in workspace_edits {
+                            self.apply_WorkspaceEdit(&edit.workspaceEdit)?;
+                            if let Some(cursorPosition) = edit.cursorPosition {
+                                self.vim()?.cursor(
+                                    cursorPosition.position.line + 1,
+                                    cursorPosition.position.character + 1,
+                                )?;
+                            }
+                        }
                     }
                 }
             }
@@ -906,7 +1077,17 @@ impl LanguageClient {
             }
             Ok(())
         })?;
+
         for f in filenames {
+            if let Ok(bufnr) = self.vim()?.eval::<_, Bufnr>(format!("bufnr('{}')", f)) {
+                // Some Language Server diagnoses non-opened buffer, so we must check if buffer exists.
+                if bufnr > 0 {
+                    self.vim()?.rpcclient.notify(
+                        "setbufvar",
+                        json!([f, VIM__StatusLineDiagnosticsCounts, {}]),
+                    )?;
+                }
+            }
             self.process_diagnostics(&f, &[])?;
         }
         self.languageClient_handleCursorMoved(&Value::Null)?;
@@ -984,11 +1165,18 @@ impl LanguageClient {
         };
 
         let trace = self.get(|state| state.trace)?;
+        let preferred_markup_kind = self.get(|state| state.preferred_markup_kind.clone())?;
 
         let result: Value = self.get_client(&Some(languageId.clone()))?.call(
             lsp::request::Initialize::METHOD,
+            #[allow(deprecated)]
             InitializeParams {
+                client_info: Some(ClientInfo {
+                    name: "LanguageClient-neovim".into(),
+                    version: Some((*self.version).clone()),
+                }),
                 process_id: Some(u64::from(std::process::id())),
+                /* deprecated in lsp types, but can't initialize without it */
                 root_path: Some(root.clone()),
                 root_uri: Some(root.to_url()?),
                 initialization_options,
@@ -997,13 +1185,14 @@ impl LanguageClient {
                         completion: Some(CompletionCapability {
                             completion_item: Some(CompletionItemCapability {
                                 snippet_support: Some(has_snippet_support),
+                                documentation_format: preferred_markup_kind.clone(),
                                 ..CompletionItemCapability::default()
                             }),
                             ..CompletionCapability::default()
                         }),
                         signature_help: Some(SignatureHelpCapability {
                             signature_information: Some(SignatureInformationSettings {
-                                documentation_format: None,
+                                documentation_format: preferred_markup_kind.clone(),
                                 parameter_information: Some(ParameterInformationSettings {
                                     label_offset_support: Some(true),
                                 }),
@@ -1028,9 +1217,19 @@ impl LanguageClient {
                         }),
                         publish_diagnostics: Some(PublishDiagnosticsCapability {
                             related_information: Some(true),
+                            ..PublishDiagnosticsCapability::default()
                         }),
                         code_lens: Some(GenericCapability {
                             dynamic_registration: Some(true),
+                        }),
+                        semantic_highlighting_capabilities: Some(
+                            SemanticHighlightingClientCapability {
+                                semantic_highlighting: true,
+                            },
+                        ),
+                        hover: Some(HoverCapability {
+                            content_format: preferred_markup_kind,
+                            ..HoverCapability::default()
                         }),
                         ..TextDocumentClientCapabilities::default()
                     }),
@@ -1067,6 +1266,11 @@ impl LanguageClient {
             error!("{}\n{:?}", message, e);
             self.vim()?.echoerr(&message)?;
         }
+        if let Err(e) = self.parseSemanticScopes(&languageId, &result) {
+            let message = format!("LanguageClient: failed to parse semantic scopes: {}", e);
+            error!("{}\n{:?}", message, e);
+            self.vim()?.echoerr(&message)?;
+        }
 
         Ok(result)
     }
@@ -1075,6 +1279,7 @@ impl LanguageClient {
         info!("Begin {}", lsp::notification::Initialized::METHOD);
         let filename = self.vim()?.get_filename(params)?;
         let languageId = self.vim()?.get_languageId(&filename, params)?;
+        self.updateSemanticHighlightTables(&languageId)?;
         self.get_client(&Some(languageId))?
             .notify(lsp::notification::Initialized::METHOD, InitializedParams {})?;
         info!("End {}", lsp::notification::Initialized::METHOD);
@@ -1215,6 +1420,7 @@ impl LanguageClient {
                     position,
                 },
                 new_name,
+                work_done_progress_params: WorkDoneProgressParams::default(),
             },
         )?;
 
@@ -1401,6 +1607,8 @@ impl LanguageClient {
                     diagnostics,
                     only: None,
                 },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
             },
         )?;
 
@@ -1418,6 +1626,7 @@ impl LanguageClient {
                     diagnostics: None,
                     edit: None,
                     command: Some(command),
+                    ..CodeAction::default()
                 },
                 CodeActionOrCommand::CodeAction(action) => action,
             })
@@ -1577,7 +1786,9 @@ impl LanguageClient {
                     tab_size,
                     insert_spaces,
                     properties: HashMap::new(),
+                    ..FormattingOptions::default()
                 },
+                work_done_progress_params: WorkDoneProgressParams::default(),
             },
         )?;
 
@@ -1618,6 +1829,7 @@ impl LanguageClient {
                     tab_size,
                     insert_spaces,
                     properties: HashMap::new(),
+                    ..FormattingOptions::default()
                 },
                 range: Range {
                     start: Position {
@@ -1629,6 +1841,7 @@ impl LanguageClient {
                         character: 0,
                     },
                 },
+                work_done_progress_params: WorkDoneProgressParams::default(),
             },
         )?;
 
@@ -1681,7 +1894,11 @@ impl LanguageClient {
         let query = try_get("query", params)?.unwrap_or_default();
         let result = self.get_client(&Some(languageId))?.call(
             lsp::request::WorkspaceSymbol::METHOD,
-            WorkspaceSymbolParams { query },
+            WorkspaceSymbolParams {
+                query,
+                partial_result_params: PartialResultParams::default(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
         )?;
 
         if !self.vim()?.get_handle(params)? {
@@ -1751,12 +1968,15 @@ impl LanguageClient {
         let languageId = self.vim()?.get_languageId(&filename, params)?;
         let command: String =
             try_get("command", params)?.ok_or_else(|| err_msg("command not found in request!"))?;
-        let arguments: Vec<Value> = try_get("arguments", params)?
-            .ok_or_else(|| err_msg("argument not found in request!"))?;
+        let arguments: Vec<Value> = try_get("arguments", params)?.unwrap_or_default();
 
         let result = self.get_client(&Some(languageId))?.call(
             lsp::request::ExecuteCommand::METHOD,
-            ExecuteCommandParams { command, arguments },
+            ExecuteCommandParams {
+                command,
+                arguments,
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
         )?;
         info!("End {}", lsp::request::ExecuteCommand::METHOD);
         Ok(result)
@@ -1811,22 +2031,38 @@ impl LanguageClient {
             return Ok(Value::Null);
         }
 
-        if code_lens.len() > 1 {
-            warn!("Multiple actions associated with this codeLens");
-            return Ok(Value::Null);
-        }
+        self.update(|state| {
+            let actions: Fallible<Vec<_>> = code_lens
+                .iter()
+                .map(|cl| match &cl.command {
+                    None => bail!("no command, skipping"),
+                    Some(cmd) => Ok(CodeAction {
+                        kind: Some(cmd.title.clone()),
+                        title: cmd.command.clone(),
+                        command: cl.clone().command,
+                        diagnostics: None,
+                        edit: None,
+                        is_preferred: None,
+                    }),
+                })
+                .filter(|c| c.is_ok())
+                .collect();
+            state.stashed_codeAction_actions = actions?;
+            Ok(())
+        })?;
 
-        if let Some(code_lens_action) = code_lens.get(0) {
-            if let Some(command) = &code_lens_action.command {
-                if !self.try_handle_command_by_client(&command)? {
-                    let params = json!({
-                    "command": command.command,
-                    "arguments": command.arguments,
-                    });
-                    self.workspace_executeCommand(&params)?;
-                }
-            }
-        }
+        let source: Fallible<Vec<_>> = code_lens
+            .iter()
+            .map(|cl| match &cl.command {
+                None => bail!("no command, skipping"),
+                Some(cmd) => Ok(format!("{}: {}", cmd.title, cmd.command)),
+            })
+            .filter(|c| c.is_ok())
+            .collect();
+
+        self.vim()?
+            .rpcclient
+            .notify("s:FZF", json!([source?, NOTIFICATION__FZFSinkCommand]))?;
 
         Ok(Value::Null)
     }
@@ -1847,6 +2083,7 @@ impl LanguageClient {
             let initialize_result: InitializeResult =
                 serde_json::from_value(initialize_result.clone())?;
             let capabilities = initialize_result.capabilities;
+
             if let Some(code_lens_provider) = capabilities.code_lens_provider {
                 info!("Begin {}", lsp::request::CodeLensRequest::METHOD);
                 let client = self.get_client(&Some(language_id))?;
@@ -1854,42 +2091,35 @@ impl LanguageClient {
                     text_document: TextDocumentIdentifier {
                         uri: filename.to_url()?,
                     },
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
                 };
 
                 let results: Value = client.call(lsp::request::CodeLensRequest::METHOD, &input)?;
-                let code_lens: Option<Vec<CodeLens>> = serde_json::from_value(results.clone())?;
+                let code_lens: Option<Vec<CodeLens>> = serde_json::from_value(results)?;
+                let mut code_lens: Vec<CodeLens> = code_lens.unwrap_or_default();
 
-                if code_lens_provider.resolve_provider.is_some() {
-                    let mut resolved_code_lens = vec![];
-                    if let Some(code_lens) = code_lens {
-                        for item in code_lens {
-                            let mut item = item;
-                            if let Some(_d) = &item.data {
-                                if let Some(cl) =
-                                    client.call(lsp::request::CodeLensResolve::METHOD, &item)?
-                                {
-                                    item = cl;
-                                }
+                if code_lens_provider.resolve_provider.unwrap_or_default() {
+                    code_lens = code_lens
+                        .into_iter()
+                        .map(|cl| {
+                            if cl.data.is_none() {
+                                return cl;
                             }
-                            resolved_code_lens.push(item);
-                        }
-                    }
 
-                    self.update(|state| {
-                        state
-                            .code_lens
-                            .insert(filename.to_owned(), resolved_code_lens);
-                        Ok(Value::Null)
-                    })?;
-                } else if let Some(code_lens) = code_lens {
-                    self.update(|state| {
-                        state.code_lens.insert(filename.to_owned(), code_lens);
-                        Ok(Value::Null)
-                    })?;
+                            client
+                                .call(lsp::request::CodeLensResolve::METHOD, &cl)
+                                .unwrap_or(cl)
+                        })
+                        .collect();
                 }
 
+                self.update(|state| {
+                    state.code_lens.insert(filename.to_owned(), code_lens);
+                    Ok(Value::Null)
+                })?;
+
                 info!("End {}", lsp::request::CodeLensRequest::METHOD);
-                return Ok(results);
             } else {
                 info!(
                     "CodeLens not supported. Skipping {}",
@@ -1897,6 +2127,10 @@ impl LanguageClient {
                 );
             }
         }
+
+        let bufnr = self.vim()?.get_bufnr(&filename, params)?;
+        let viewport = self.vim()?.get_viewport(params)?;
+        self.draw_virtual_texts(&filename, viewport, bufnr)?;
 
         Ok(Value::Null)
     }
@@ -2051,7 +2285,7 @@ impl LanguageClient {
 
         let mut filename = params.uri.filepath()?.to_string_lossy().into_owned();
         // Workaround bug: remove first '/' in case of '/C:/blabla'.
-        if filename.chars().nth(0) == Some('/') && filename.chars().nth(2) == Some(':') {
+        if filename.starts_with('/') && filename.chars().nth(2) == Some(':') {
             filename.remove(0);
         }
         // Unify name to avoid mismatch due to case insensitivity.
@@ -2074,6 +2308,59 @@ impl LanguageClient {
             Ok(())
         })?;
         self.update_quickfixlist()?;
+
+        let mut severityCount: HashMap<String, u64> = [
+            (
+                DiagnosticSeverity::Error
+                    .to_quickfix_entry_type()
+                    .to_string(),
+                0,
+            ),
+            (
+                DiagnosticSeverity::Warning
+                    .to_quickfix_entry_type()
+                    .to_string(),
+                0,
+            ),
+            (
+                DiagnosticSeverity::Information
+                    .to_quickfix_entry_type()
+                    .to_string(),
+                0,
+            ),
+            (
+                DiagnosticSeverity::Hint
+                    .to_quickfix_entry_type()
+                    .to_string(),
+                0,
+            ),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        for diagnostic in diagnostics.iter() {
+            let severity = diagnostic
+                .severity
+                .unwrap_or(DiagnosticSeverity::Hint)
+                .to_quickfix_entry_type()
+                .to_string();
+            let count = severityCount.entry(severity).or_insert(0);
+            *count += 1;
+        }
+
+        if let Ok(bufnr) = self
+            .vim()?
+            .eval::<_, Bufnr>(format!("bufnr('{}')", filename))
+        {
+            // Some Language Server diagnoses non-opened buffer, so we must check if buffer exists.
+            if bufnr > 0 {
+                self.vim()?.rpcclient.notify(
+                    "setbufvar",
+                    json!([filename, VIM__StatusLineDiagnosticsCounts, severityCount]),
+                )?;
+            }
+        }
 
         let current_filename: String = self.vim()?.get_filename(&Value::Null)?;
         if filename != current_filename.canonicalize() {
@@ -2100,6 +2387,218 @@ impl LanguageClient {
             .notify("s:ExecuteAutocmd", "LanguageClientDiagnosticsChanged")?;
 
         info!("End {}", lsp::notification::PublishDiagnostics::METHOD);
+        Ok(())
+    }
+
+    pub fn textDocument_semanticHighlight(&self, params: &Value) -> Fallible<()> {
+        info!("Begin {}", lsp::notification::SemanticHighlighting::METHOD);
+        let mut params: SemanticHighlightingParams = params.clone().to_lsp()?;
+
+        // TODO: Do we need to handle the versioning of the file?
+        let mut filename = params
+            .text_document
+            .uri
+            .filepath()?
+            .to_string_lossy()
+            .into_owned();
+        // Workaround bug: remove first '/' in case of '/C:/blabla'.
+        if filename.starts_with('/') && filename.chars().nth(2) == Some(':') {
+            filename.remove(0);
+        }
+        // Unify name to avoid mismatch due to case insensitivity.
+        let filename = filename.canonicalize();
+        let languageId = self.vim()?.get_languageId(&filename, &Value::Null)?;
+
+        let opt_hl_table = self.get(|state| {
+            state
+                .semantic_scope_to_hl_group_table
+                .get(&languageId)
+                .cloned()
+        })?;
+
+        // Sort lines in ascending order
+        params.lines.sort_by(|a, b| a.line.cmp(&b.line));
+
+        // Remove obviously invalid values
+        while let Some(line_info) = params.lines.first() {
+            if line_info.line >= 0 {
+                break;
+            } else {
+                warn!(
+                    "Invalid Semantic Highlight Line: {}",
+                    params.lines.remove(0).line
+                );
+            }
+        }
+
+        let semantic_hl_state = TextDocumentSemanticHighlightState {
+            last_version: params.text_document.version,
+            symbols: params.lines,
+            highlights: None,
+        };
+
+        if let Some(hl_table) = opt_hl_table {
+            let ns_id = self.get_or_create_namespace(&LCNamespace::SemanticHighlight)?;
+
+            let buffer = self.vim()?.get_bufnr(&filename, &Value::Null)?;
+
+            if buffer == -1 {
+                error!(
+                    "Received Semantic Highlighting for non-open buffer: {}",
+                    filename
+                );
+                return Ok(());
+            }
+
+            /*
+             * Currently servers update entire regions of text at a time or a
+             * single line so simply clear between the first and last line to
+             * ensure no highlights are left dangling
+             */
+            let mut clear_region: Option<(u64, u64)> = None;
+            let mut highlights = Vec::with_capacity(semantic_hl_state.symbols.len());
+
+            for line in &semantic_hl_state.symbols {
+                if let Some(tokens) = &line.tokens {
+                    for token in tokens {
+                        if token.length == 0 {
+                            continue;
+                        }
+
+                        if let Some(Some(group)) = hl_table.get(token.scope as usize) {
+                            highlights.push(Highlight {
+                                line: line.line as u64,
+                                character_start: token.character as u64,
+                                character_end: token.character as u64 + token.length as u64,
+                                group: group.clone(),
+                                text: String::new(),
+                            });
+                        }
+                    }
+
+                    match clear_region {
+                        Some((begin, _)) => {
+                            clear_region = Some((begin, line.line as u64 + 1));
+                        }
+                        None => {
+                            clear_region = Some((line.line as u64, line.line as u64 + 1));
+                        }
+                    }
+                }
+            }
+
+            info!(
+                "Semantic Highlighting Region [{}, {}]:",
+                semantic_hl_state
+                    .symbols
+                    .first()
+                    .map_or(-1, |h| h.line as i64),
+                semantic_hl_state
+                    .symbols
+                    .last()
+                    .map_or(-1, |h| h.line as i64)
+            );
+
+            info!(
+                "Semantic Highlighting Region (Parsed) [{}, {}]:",
+                highlights.first().map_or(-1, |h| h.line as i64),
+                highlights.last().map_or(-1, |h| h.line as i64)
+            );
+
+            let mut clears = Vec::new();
+            if let Some((begin, end)) = clear_region {
+                clears.push(ClearNamespace {
+                    line_start: begin,
+                    line_end: end,
+                });
+            }
+
+            let mut num_semantic_hls = 0;
+            let num_new_semantic_hls = highlights.len();
+
+            self.update(|state| {
+                state.vim.rpcclient.notify(
+                    "s:ApplySemanticHighlights",
+                    json!([buffer, ns_id, clears, highlights]),
+                )?;
+
+                let old_semantic_hl_state = state
+                    .semantic_highlights
+                    .insert(languageId.clone(), semantic_hl_state);
+
+                let semantic_hl_state = state.semantic_highlights.get_mut(&languageId).unwrap();
+
+                let mut combined_hls = Vec::with_capacity(highlights.len());
+
+                let mut existing_hls = old_semantic_hl_state
+                    .map_or(Vec::new(), |hl_state| {
+                        hl_state.highlights.unwrap_or_default()
+                    })
+                    .into_iter()
+                    .peekable();
+
+                let mut new_hls = highlights.into_iter().peekable();
+
+                // Incrementally update the highlighting
+                loop {
+                    match (existing_hls.peek(), new_hls.peek()) {
+                        (Some(existing_hl), Some(new_hl)) => {
+                            use std::cmp::Ordering;
+
+                            match existing_hl.line.cmp(&new_hl.line) {
+                                Ordering::Less => {
+                                    if clear_region.unwrap_or((0, 0)).0 <= existing_hl.line
+                                        && existing_hl.line < clear_region.unwrap_or((0, 0)).1
+                                    {
+                                        // within clear region, this highlight gets cleared
+                                        existing_hls.next();
+                                    } else {
+                                        combined_hls
+                                            .push(existing_hls.next().expect("unreachable"));
+                                    }
+                                }
+                                Ordering::Greater => {
+                                    combined_hls.push(new_hls.next().expect("unreachable"));
+                                }
+                                Ordering::Equal => {
+                                    // existing highlight on same line as new, it gets cleared
+                                    existing_hls.next();
+                                }
+                            }
+                        }
+                        (Some(_), None) => {
+                            combined_hls.push(existing_hls.next().expect("unreachable"));
+                        }
+                        (None, Some(_)) => {
+                            combined_hls.push(new_hls.next().expect("unreachable"));
+                        }
+                        (None, None) => {
+                            break;
+                        }
+                    }
+                }
+
+                num_semantic_hls = combined_hls.len();
+
+                semantic_hl_state.highlights = Some(combined_hls);
+
+                Ok(())
+            })?;
+
+            info!(
+                "Applied Semantic Highlighting for {} Symbols ({} new)",
+                num_semantic_hls, num_new_semantic_hls
+            )
+        } else {
+            self.update(|state| {
+                state
+                    .semantic_highlights
+                    .insert(languageId.clone(), semantic_hl_state);
+                Ok(())
+            })?;
+        }
+
+        info!("End {}", lsp::notification::SemanticHighlighting::METHOD);
         Ok(())
     }
 
@@ -2252,6 +2751,11 @@ impl LanguageClient {
         if let Err(err) = result {
             error!("Error: {:?}", err);
         }
+
+        self.vim()?
+            .rpcclient
+            .notify("setbufvar", json!([filename, VIM__IsServerRunning, 0]))?;
+
         if let Err(err) = self.cleanup(&languageId) {
             error!("Error: {:?}", err);
         }
@@ -2298,8 +2802,7 @@ impl LanguageClient {
         let loggingLevel =
             try_get("loggingLevel", params)?.ok_or_else(|| err_msg("loggingLevel not found!"))?;
         self.update(|state| {
-            logger::update_settings(&state.logger, &state.loggingFile, loggingLevel)?;
-            state.loggingLevel = loggingLevel;
+            state.logger.set_level(loggingLevel)?;
             Ok(())
         })?;
         info!("End {}", REQUEST__SetLoggingLevel);
@@ -2384,6 +2887,28 @@ impl LanguageClient {
         }
 
         info!("End {}", NOTIFICATION__HandleBufNewFile);
+        Ok(())
+    }
+
+    pub fn languageClient_handleBufEnter(&self, params: &Value) -> Fallible<()> {
+        info!("Begin {}", NOTIFICATION__HandleBufEnter);
+        if self.vim()?.get_filename(params)?.is_empty() {
+            return Ok(());
+        }
+
+        let filename = self.vim()?.get_filename(params)?.canonicalize();
+        let languageId = self.vim()?.get_languageId(&filename, params)?;
+
+        if self.get(|state| state.clients.contains_key(&Some(languageId.clone())))? {
+            self.vim()?
+                .rpcclient
+                .notify("setbufvar", json!([filename, VIM__IsServerRunning, 1]))?;
+        } else {
+            self.vim()?
+                .rpcclient
+                .notify("setbufvar", json!([filename, VIM__IsServerRunning, 0]))?;
+        }
+        info!("End {}", NOTIFICATION__HandleBufEnter);
         Ok(())
     }
 
@@ -2514,34 +3039,28 @@ impl LanguageClient {
             })?;
         }
 
-        let bufnr = self.vim()?.get_bufnr(&filename, params)?;
         let viewport = self.vim()?.get_viewport(params)?;
 
         // use the most severe diagnostic of each line as the sign
         let signs_next: Vec<_> = self.update(|state| {
-            let limit = if let Some(n) = state.diagnosticsSignsMax {
-                n as usize
-            } else {
-                usize::max_value()
-            };
-            Ok(state
+            let mut diagnostics = state
                 .diagnostics
                 .entry(filename.clone())
                 .or_default()
                 .iter()
                 .filter(|diag| viewport.overlaps(diag.range))
-                .map(|diag| {
+                .sorted_by_key(|diag| {
                     (
                         diag.range.start.line,
                         diag.severity.unwrap_or(DiagnosticSeverity::Hint),
                     )
                 })
-                .sorted_by_key(|(line, _)| *line)
-                .group_by(|(line, _)| *line)
+                .collect_vec();
+            diagnostics.dedup_by_key(|diag| diag.range.start.line);
+            Ok(diagnostics
                 .into_iter()
-                .filter_map(|(_, group)| group.min_by_key(|(_, severity)| *severity))
-                .take(limit)
-                .map(|(line, severity)| Sign::new(line, format!("LanguageClient{:?}", severity)))
+                .take(state.diagnosticsSignsMax.unwrap_or(std::usize::MAX))
+                .map(Into::into)
                 .collect())
         })?;
         self.update(|state| {
@@ -2564,12 +3083,6 @@ impl LanguageClient {
                         signs_to_delete.push(s.clone());
                     }
                     _ => {}
-                }
-            }
-            for sign in &mut signs_to_add {
-                if sign.id == 0 {
-                    state.sign_next_id += 1;
-                    sign.id = state.sign_next_id;
                 }
             }
 
@@ -2639,6 +3152,19 @@ impl LanguageClient {
                 .notify("s:AddHighlights", json!([source, highlights]))?;
         }
 
+        let bufnr = self.vim()?.get_bufnr(&filename, params)?;
+        self.draw_virtual_texts(&filename, viewport, bufnr)?;
+
+        info!("End {}", NOTIFICATION__HandleCursorMoved);
+        Ok(())
+    }
+
+    fn draw_virtual_texts(
+        &self,
+        filename: &str,
+        viewport: viewport::Viewport,
+        bufnr: i64,
+    ) -> Fallible<()> {
         let mut virtual_texts = vec![];
         let use_virtual_text = self.get(|state| state.use_virtual_text.clone())?;
 
@@ -2646,54 +3172,86 @@ impl LanguageClient {
         if UseVirtualText::All == use_virtual_text
             || UseVirtualText::Diagnostics == use_virtual_text
         {
-            let diagnostics = self.get(|state| state.diagnostics.clone())?;
-            let diagnosticsDisplay = self.get(|state| state.diagnosticsDisplay.clone())?;
-            let diag_list = diagnostics.get(&filename);
-            if let Some(diag_list) = diag_list {
-                for diag in diag_list {
-                    if viewport.overlaps(diag.range) {
-                        virtual_texts.push(VirtualText {
-                            line: diag.range.start.line,
-                            text: diag.message.replace("\n", "  ").clone(),
-                            hl_group: diagnosticsDisplay
-                                .get(&(diag.severity.unwrap_or(DiagnosticSeverity::Hint) as u64))
-                                .ok_or_else(|| err_msg("Failed to get display"))?
-                                .virtualTexthl
-                                .clone(),
-                        });
-                    }
-                }
-            }
+            let vt_diagnostics = self
+                .virtual_texts_from_diagnostics(filename, viewport)?
+                .into_iter();
+            virtual_texts.extend(vt_diagnostics);
         }
 
         // code lens
         if UseVirtualText::All == use_virtual_text || UseVirtualText::CodeLens == use_virtual_text {
-            let filename = self.vim()?.get_filename(params)?;
-            let code_lenses =
-                self.get(|state| state.code_lens.get(&filename).cloned().unwrap_or_default())?;
+            virtual_texts.extend(self.virtual_texts_from_code_lenses(filename)?.into_iter());
+        }
 
-            for cl in code_lenses {
-                if let Some(command) = cl.command {
+        if self.get(|state| state.is_nvim)? {
+            let namespace_id = self.get_or_create_namespace(&LCNamespace::VirtualText)?;
+            self.vim()?.set_virtual_texts(
+                bufnr,
+                namespace_id,
+                viewport.start,
+                viewport.end,
+                &virtual_texts,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn virtual_texts_from_diagnostics(
+        &self,
+        filename: &str,
+        viewport: viewport::Viewport,
+    ) -> Fallible<Vec<VirtualText>> {
+        let mut virtual_texts = vec![];
+        let diagnostics = self.get(|state| state.diagnostics.clone())?;
+        let diagnosticsDisplay = self.get(|state| state.diagnosticsDisplay.clone())?;
+        let diag_list = diagnostics.get(filename);
+        if let Some(diag_list) = diag_list {
+            for diag in diag_list {
+                if viewport.overlaps(diag.range) {
                     virtual_texts.push(VirtualText {
-                        line: cl.range.start.line,
-                        text: command.title,
-                        hl_group: "Comment".into(),
-                    })
+                        line: diag.range.start.line,
+                        text: diag.message.replace("\n", "  ").clone(),
+                        hl_group: diagnosticsDisplay
+                            .get(&(diag.severity.unwrap_or(DiagnosticSeverity::Hint) as u64))
+                            .ok_or_else(|| err_msg("Failed to get display"))?
+                            .virtualTexthl
+                            .clone(),
+                    });
                 }
             }
         }
 
-        let namespace_id = self.get_or_create_namespace()?;
-        self.vim()?.set_virtual_texts(
-            bufnr,
-            namespace_id,
-            viewport.start,
-            viewport.end,
-            &virtual_texts,
-        )?;
+        Ok(virtual_texts)
+    }
 
-        info!("End {}", NOTIFICATION__HandleCursorMoved);
-        Ok(())
+    fn virtual_texts_from_code_lenses(&self, filename: &str) -> Fallible<Vec<VirtualText>> {
+        let mut virtual_texts = vec![];
+        let code_lenses =
+            self.get(|state| state.code_lens.get(filename).cloned().unwrap_or_default())?;
+
+        for cl in code_lenses {
+            if let Some(command) = cl.command {
+                let line = cl.range.start.line;
+                let text = command.title;
+
+                match virtual_texts
+                    .iter()
+                    .position(|v: &VirtualText| v.line == line)
+                {
+                    Some(idx) => virtual_texts[idx]
+                        .text
+                        .push_str(format!(" | {}", text).as_str()),
+                    None => virtual_texts.push(VirtualText {
+                        line,
+                        text,
+                        hl_group: "Comment".into(),
+                    }),
+                }
+            }
+        }
+
+        Ok(virtual_texts)
     }
 
     pub fn languageClient_handleCompleteDone(&self, params: &Value) -> Fallible<()> {
@@ -2731,15 +3289,18 @@ impl LanguageClient {
                 edits.push(edit);
             };
         }
-        if let Some(aedits) = lspitem.additional_text_edits {
-            edits.extend(aedits);
-        };
+
+        if self.get(|state| state.applyCompletionAdditionalTextEdits)? {
+            if let Some(aedits) = lspitem.additional_text_edits {
+                edits.extend(aedits);
+            };
+        }
 
         if edits.is_empty() {
             return Ok(());
         }
 
-        self.apply_TextEdits(filename, &edits)?;
+        let position = self.apply_TextEdits(filename, &edits, position)?;
         self.vim()?
             .cursor(position.line + 1, position.character + 1)
     }
@@ -2844,6 +3405,80 @@ impl LanguageClient {
 
         info!("End {}", NOTIFICATION__FZFSinkCommand);
         Ok(())
+    }
+
+    pub fn languageClient_semanticScopes(&self, params: &Value) -> Fallible<Value> {
+        let filename = self.vim()?.get_filename(params)?;
+        let languageId = self.vim()?.get_languageId(&filename, params)?;
+
+        let (scopes, mut scope_mapping) = self.get(|state| {
+            (
+                state
+                    .semantic_scopes
+                    .get(&languageId)
+                    .cloned()
+                    .unwrap_or_default(),
+                state
+                    .semantic_scope_to_hl_group_table
+                    .get(&languageId)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        })?;
+
+        let mut semantic_scopes = Vec::new();
+
+        // If the user has not set up highlighting yet the table does not exist
+        if scopes.len() > scope_mapping.len() {
+            scope_mapping.resize(scopes.len(), None);
+        }
+
+        for (scope, opt_hl_group) in scopes.iter().zip(scope_mapping.iter()) {
+            if let Some(hl_group) = opt_hl_group {
+                semantic_scopes.push(json!({
+                    "scope": scope,
+                    "hl_group": hl_group,
+                }));
+            } else {
+                semantic_scopes.push(json!({
+                    "scope": scope,
+                    "hl_group": "None",
+                }));
+            }
+        }
+
+        Ok(json!(semantic_scopes))
+    }
+
+    pub fn languageClient_semanticHlSyms(&self, params: &Value) -> Fallible<Value> {
+        let filename = self.vim()?.get_filename(params)?;
+        let languageId = self.vim()?.get_languageId(&filename, params)?;
+
+        let (opt_scopes, opt_hl_state) = self.get(|state| {
+            (
+                state.semantic_scopes.get(&languageId).cloned(),
+                state.semantic_highlights.get(&languageId).cloned(),
+            )
+        })?;
+
+        if let (Some(scopes), Some(hl_state)) = (opt_scopes, opt_hl_state) {
+            let mut symbols = Vec::new();
+
+            for sym in hl_state.symbols {
+                for token in sym.tokens.unwrap_or_default() {
+                    symbols.push(json!({
+                        "line": sym.line as u64,
+                        "character_start": token.character as u64,
+                        "character_end": token.character as u64 + token.length as u64,
+                        "scope": scopes.get(token.scope as usize).cloned().unwrap_or_default()
+                    }));
+                }
+            }
+
+            Ok(json!(symbols))
+        } else {
+            Ok(json!([]))
+        }
     }
 
     pub fn NCM_refresh(&self, params: &Value) -> Fallible<Value> {
@@ -3205,7 +3840,9 @@ impl LanguageClient {
             self.get(|state| state.tx.clone())?,
         )?;
         self.update(|state| {
-            state.clients.insert(Some(languageId.clone()), client);
+            state
+                .clients
+                .insert(Some(languageId.clone()), Arc::new(client));
             Ok(())
         })?;
 
@@ -3227,6 +3864,10 @@ impl LanguageClient {
             }))?,
             Err(err) => warn!("Failed to get workspace settings: {}", err),
         }
+
+        self.vim()?
+            .rpcclient
+            .notify("setbufvar", json!([filename, VIM__IsServerRunning, 1]))?;
 
         self.textDocument_didOpen(&params)?;
         self.textDocument_didChange(&params)?;
@@ -3371,11 +4012,8 @@ impl LanguageClient {
                 "Language server stderr: {}\n",
                 state.serverStderr.clone().unwrap_or_default()
             );
-            msg += &format!("Log level: {}\n", state.loggingLevel);
-            msg += &format!(
-                "Log file: {}\n",
-                state.loggingFile.clone().unwrap_or_default()
-            );
+            msg += &format!("Log level: {}\n", state.logger.level);
+            msg += &format!("Log file: {:?}\n", state.logger.path);
         })?;
         self.vim()?.echo(&msg)?;
         info!("End {}", REQUEST__DebugInfo);

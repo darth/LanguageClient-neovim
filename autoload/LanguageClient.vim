@@ -260,6 +260,16 @@ function! s:MatchDelete(ids) abort
     endfor
 endfunction
 
+function! s:ApplySemanticHighlights(bufnr, ns_id, clears, highlights) abort
+    for clear in a:clears
+        call nvim_buf_clear_namespace(a:bufnr, a:ns_id, clear.line_start, clear.line_end)
+    endfor
+
+    for hl in a:highlights
+        call nvim_buf_add_highlight(a:bufnr, a:ns_id, hl.group, hl.line, hl.character_start, hl.character_end)
+    endfor
+endfunction
+
 " Batch version of nvim_buf_add_highlight
 function! s:AddHighlights(source, highlights) abort
     for hl in a:highlights
@@ -268,7 +278,7 @@ function! s:AddHighlights(source, highlights) abort
 endfunction
 
 " Get an variable value.
-" Get variable from uffer local, or else global, or else default, or else v:null.
+" Get variable from buffer local, or else global, or else default, or else v:null.
 function! s:GetVar(...) abort
     let name = a:1
 
@@ -278,6 +288,16 @@ function! s:GetVar(...) abort
         return get(g:, name)
     else
         return get(a:000, 1, v:null)
+    endif
+endfunction
+
+" if the argument is a list, return it unchanged, otherwise return the list
+" containing the argument.
+function! s:ToList(x) abort
+    if type(a:x) == v:t_list
+        return a:x
+    else
+        return [ a:x ]
     endif
 endfunction
 
@@ -413,7 +433,8 @@ function! s:OpenHoverPreview(bufname, lines, filetype) abort
 
         execute 'noswapfile edit!' a:bufname
 
-        setlocal winhl=Normal:CursorLine
+        let float_win_highlight = s:GetVar('LanguageClient_floatingHoverHighlight', 'Normal:CursorLine')
+        execute printf('setlocal winhl=%s', float_win_highlight)
     elseif display_approach ==# 'popup_win'
         let pop_win_id = popup_atcursor(a:lines, {})
         call setbufvar(winbufnr(pop_win_id), '&filetype', a:filetype)
@@ -1047,6 +1068,24 @@ function! LanguageClient#handleBufNewFile() abort
     endtry
 endfunction
 
+function! LanguageClient#handleBufEnter() abort
+    if !exists('b:LanguageClient_isServerRunning')
+      let b:LanguageClient_isServerRunning = 0
+    endif
+
+    if !exists('b:LanguageClient_statusLineDiagnosticsCounts')
+      let b:LanguageClient_statusLineDiagnosticsCounts = {}
+    endif
+
+    try
+        call LanguageClient#Notify('languageClient/handleBufEnter', {
+                    \ 'filename': LSP#filename(),
+                    \ })
+    catch
+        call s:Debug('LanguageClient caught exception: ' . string(v:exception))
+    endtry
+endfunction
+
 function! LanguageClient#handleFileType() abort
     try
         if s:Debounce(2, 'LanguageClient#handleFileType')
@@ -1296,6 +1335,10 @@ function! LanguageClient#serverStatusMessage() abort
     return g:LanguageClient_serverStatusMessage
 endfunction
 
+function! LanguageClient#isServerRunning() abort
+    return b:LanguageClient_isServerRunning
+endfunction
+
 " Example function usable for status line.
 function! LanguageClient#statusLine() abort
     if g:LanguageClient_serverStatusMessage ==# ''
@@ -1303,6 +1346,10 @@ function! LanguageClient#statusLine() abort
     endif
 
     return '[' . g:LanguageClient_serverStatusMessage . ']'
+endfunction
+
+function! LanguageClient#statusLineDiagnosticsCounts() abort
+    return b:LanguageClient_statusLineDiagnosticsCounts
 endfunction
 
 function! LanguageClient#cquery_base(...) abort
@@ -1391,6 +1438,70 @@ function! LanguageClient_contextMenu() abort
     endif
 
     return LanguageClient_handleContextMenuItem(l:options[l:selection - 1])
+endfunction
+
+function! LanguageClient_showSemanticScopes(...) abort
+    let l:params = get(a:000, 0, {})
+    let l:Callback = get(a:000, 1, function('s:print_semantic_scopes'))
+
+    return LanguageClient#Call('languageClient/semanticScopes', l:params, l:Callback)
+endfunction
+
+function! s:print_semantic_scopes(response) abort
+    let l:scope_mappings = a:response.result
+
+    let l:msg = ''
+    for mapping in l:scope_mappings
+        let l:msg .= "Highlight Group:\n"
+        let l:msg .= ' ' . l:mapping.hl_group . "\n"
+
+        let l:msg .= "Semantic Scope:\n"
+        let l:spaces = ' '
+        for l:scope_name in l:mapping.scope
+            let l:msg .= l:spaces . l:scope_name . "\n"
+            let l:spaces .= ' '
+        endfor
+        let l:msg .= "\n"
+    endfor
+
+    echo l:msg
+endfunction
+
+function! LanguageClient#showSemanticHighlightSymbols(...) abort
+    let l:params = get(a:000, 0, {})
+    let l:Callback = get(a:000, 1, v:null)
+
+    return LanguageClient#Call('languageClient/showSemanticHighlightSymbols', l:params, l:Callback)
+endfunction
+
+function! LanguageClient_showCursorSemanticHighlightSymbols(...) abort
+    let l:params = get(a:000, 0, {})
+    let l:Callback = get(a:000, 1, function('s:print_cursor_semantic_symbol'))
+
+    return LanguageClient#showSemanticHighlightSymbols(l:params, l:Callback)
+endfunction
+
+function! s:print_cursor_semantic_symbol(response) abort
+    let l:symbols = a:response.result
+    let l:lines = []
+
+    for symbol in l:symbols
+        if l:symbol.line + 1 == line('.') &&
+                    \ symbol.character_start < col('.') &&
+                    \ col('.') <= symbol.character_end
+            let l:spaces = ''
+            for scope_name in l:symbol.scope
+                call add(l:lines, l:spaces . l:scope_name)
+                let l:spaces .= ' '
+            endfor
+        endif
+    endfor
+
+    if len(l:lines) > 0
+        call s:OpenHoverPreview('SemanticScopes', l:lines, 'text')
+    else
+        call s:Echowarn('No Symbol Under Cursor or No Semantic Highlighting')
+    endif
 endfunction
 
 function! LanguageClient#debugInfo(...) abort

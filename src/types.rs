@@ -1,4 +1,5 @@
 use super::*;
+use crate::logger::Logger;
 use crate::rpcclient::RpcClient;
 use crate::sign::Sign;
 use crate::vim::Vim;
@@ -33,7 +34,11 @@ pub const REQUEST__ExplainErrorAtPoint: &str = "languageClient/explainErrorAtPoi
 pub const REQUEST__FindLocations: &str = "languageClient/findLocations";
 pub const REQUEST__DebugInfo: &str = "languageClient/debugInfo";
 pub const REQUEST__CodeLensAction: &str = "LanguageClient/handleCodeLensAction";
+pub const REQUEST__SemanticScopes: &str = "languageClient/semanticScopes";
+pub const REQUEST__ShowSemanticHighlightSymbols: &str =
+    "languageClient/showSemanticHighlightSymbols";
 pub const NOTIFICATION__HandleBufNewFile: &str = "languageClient/handleBufNewFile";
+pub const NOTIFICATION__HandleBufEnter: &str = "languageClient/handleBufEnter";
 pub const NOTIFICATION__HandleFileType: &str = "languageClient/handleFileType";
 pub const NOTIFICATION__HandleTextChanged: &str = "languageClient/handleTextChanged";
 pub const NOTIFICATION__HandleBufWritePost: &str = "languageClient/handleBufWritePost";
@@ -58,6 +63,8 @@ pub const REQUEST__ClassFileContents: &str = "java/classFileContents";
 // Vim variable names
 pub const VIM__ServerStatus: &str = "g:LanguageClient_serverStatus";
 pub const VIM__ServerStatusMessage: &str = "g:LanguageClient_serverStatusMessage";
+pub const VIM__IsServerRunning: &str = "LanguageClient_isServerRunning";
+pub const VIM__StatusLineDiagnosticsCounts: &str = "LanguageClient_statusLineDiagnosticsCounts";
 
 /// Thread safe read.
 pub trait SyncRead: BufRead + Sync + Send + Debug {}
@@ -110,7 +117,7 @@ pub struct State {
     pub tx: crossbeam::channel::Sender<Call>,
 
     #[serde(skip_serializing)]
-    pub clients: HashMap<LanguageId, RpcClient>,
+    pub clients: HashMap<LanguageId, Arc<RpcClient>>,
 
     #[serde(skip_serializing)]
     pub vim: Vim,
@@ -120,16 +127,19 @@ pub struct State {
     pub roots: HashMap<String, String>,
     pub text_documents: HashMap<String, TextDocumentItem>,
     pub text_documents_metadata: HashMap<String, TextDocumentItemMetadata>,
+    pub semantic_scopes: HashMap<String, Vec<Vec<String>>>,
+    pub semantic_scope_to_hl_group_table: HashMap<String, Vec<Option<String>>>,
+    // filename => semantic highlight state
+    pub semantic_highlights: HashMap<String, TextDocumentSemanticHighlightState>,
     // filename => diagnostics.
     pub diagnostics: HashMap<String, Vec<Diagnostic>>,
     // filename => codeLens.
     pub code_lens: HashMap<String, Vec<CodeLens>>,
     #[serde(skip_serializing)]
     pub line_diagnostics: HashMap<(String, u64), String>,
-    pub sign_next_id: u64,
     /// Active signs.
     pub signs: HashMap<String, BTreeMap<u64, Sign>>,
-    pub namespace_id: Option<i64>,
+    pub namespace_ids: HashMap<String, i64>,
     pub highlight_source: Option<u64>,
     pub highlights: HashMap<String, Vec<Highlight>>,
     pub highlights_placed: HashMap<String, Vec<Highlight>>,
@@ -149,6 +159,9 @@ pub struct State {
 
     // User settings.
     pub serverCommands: HashMap<String, Vec<String>>,
+    // languageId => (scope_regex => highlight group)
+    pub semanticHighlightMaps: HashMap<String, HashMap<String, String>>,
+    pub semanticScopeSeparator: String,
     pub autoStart: bool,
     pub selectionUI: SelectionUI,
     pub selectionUI_autoOpen: bool,
@@ -156,39 +169,38 @@ pub struct State {
     pub diagnosticsEnable: bool,
     pub diagnosticsList: DiagnosticsList,
     pub diagnosticsDisplay: HashMap<u64, DiagnosticsDisplay>,
-    pub diagnosticsSignsMax: Option<u64>,
+    pub diagnosticsSignsMax: Option<usize>,
     pub diagnostics_max_severity: DiagnosticSeverity,
     pub documentHighlightDisplay: HashMap<u64, DocumentHighlightDisplay>,
     pub windowLogMessageLevel: MessageType,
-    pub settingsPath: String,
+    pub settingsPath: Vec<String>,
     pub loadSettings: bool,
     pub rootMarkers: Option<RootMarkers>,
     pub change_throttle: Option<Duration>,
     pub wait_output_timeout: Duration,
     pub hoverPreview: HoverPreviewOption,
     pub completionPreferTextEdit: bool,
+    pub applyCompletionAdditionalTextEdits: bool,
     pub use_virtual_text: UseVirtualText,
     pub echo_project_root: bool,
 
-    pub loggingFile: Option<String>,
-    pub loggingLevel: log::LevelFilter,
     pub serverStderr: Option<String>,
-    #[serde(skip_serializing)]
-    pub logger: log4rs::Handle,
+    pub logger: Logger,
+    pub preferred_markup_kind: Option<Vec<MarkupKind>>,
 }
 
 impl State {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(tx: crossbeam::channel::Sender<Call>) -> Fallible<Self> {
-        let logger = logger::init()?;
+        let logger = Logger::new()?;
 
-        let client = RpcClient::new(
+        let client = Arc::new(RpcClient::new(
             None,
             BufReader::new(std::io::stdin()),
             BufWriter::new(std::io::stdout()),
             None,
             tx.clone(),
-        )?;
+        )?);
 
         Ok(Self {
             tx,
@@ -204,12 +216,14 @@ impl State {
             roots: HashMap::new(),
             text_documents: HashMap::new(),
             text_documents_metadata: HashMap::new(),
+            semantic_scopes: HashMap::new(),
+            semantic_scope_to_hl_group_table: HashMap::new(),
+            semantic_highlights: HashMap::new(),
             code_lens: HashMap::new(),
             diagnostics: HashMap::new(),
             line_diagnostics: HashMap::new(),
-            sign_next_id: 75_000,
             signs: HashMap::new(),
-            namespace_id: None,
+            namespace_ids: HashMap::new(),
             highlight_source: None,
             highlights: HashMap::new(),
             highlights_placed: HashMap::new(),
@@ -225,6 +239,8 @@ impl State {
             stashed_codeAction_actions: vec![],
 
             serverCommands: HashMap::new(),
+            semanticHighlightMaps: HashMap::new(),
+            semanticScopeSeparator: ":".into(),
             autoStart: true,
             selectionUI: SelectionUI::LocationList,
             selectionUI_autoOpen: true,
@@ -236,18 +252,18 @@ impl State {
             diagnostics_max_severity: DiagnosticSeverity::Hint,
             documentHighlightDisplay: DocumentHighlightDisplay::default(),
             windowLogMessageLevel: MessageType::Warning,
-            settingsPath: format!(".vim{}settings.json", std::path::MAIN_SEPARATOR),
+            settingsPath: vec![format!(".vim{}settings.json", std::path::MAIN_SEPARATOR)],
             loadSettings: false,
             rootMarkers: None,
             change_throttle: None,
             wait_output_timeout: Duration::from_secs(10),
             hoverPreview: HoverPreviewOption::default(),
             completionPreferTextEdit: false,
+            applyCompletionAdditionalTextEdits: true,
             use_virtual_text: UseVirtualText::All,
             echo_project_root: true,
-            loggingFile: None,
-            loggingLevel: log::LevelFilter::Warn,
             serverStderr: None,
+            preferred_markup_kind: None,
 
             logger,
         })
@@ -276,6 +292,20 @@ impl FromStr for SelectionUI {
             "QUICKFIX" => Ok(SelectionUI::Quickfix),
             "LOCATIONLIST" | "LOCATION-LIST" => Ok(SelectionUI::LocationList),
             _ => bail!("Invalid option for LanguageClient_selectionUI: {}", s),
+        }
+    }
+}
+
+pub enum LCNamespace {
+    VirtualText,
+    SemanticHighlight,
+}
+
+impl LCNamespace {
+    pub fn name(&self) -> String {
+        match self {
+            LCNamespace::VirtualText => "LanguageClient_VirtualText".into(),
+            LCNamespace::SemanticHighlight => "LanguageClient_SemanticHighlight".into(),
         }
     }
 }
@@ -423,6 +453,13 @@ impl DocumentHighlightDisplay {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextDocumentSemanticHighlightState {
+    pub last_version: Option<i64>,
+    pub symbols: Vec<SemanticHighlightingInformation>,
+    pub highlights: Option<Vec<Highlight>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Highlight {
     pub line: u64,
     pub character_start: u64,
@@ -436,6 +473,12 @@ impl PartialEq for Highlight {
         // Quick check whether highlight should be updated.
         self.text == other.text && self.group == other.group
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClearNamespace {
+    pub line_start: u64,
+    pub line_end: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
