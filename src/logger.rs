@@ -1,9 +1,12 @@
-use super::*;
+use anyhow::{Context, Result};
 use derivative::Derivative;
 use log::LevelFilter;
 use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Config, Root};
 use log4rs::encode::pattern::PatternEncoder;
+use serde::Serialize;
+use std::io::Write;
+use std::path::PathBuf;
 
 #[derive(Derivative)]
 #[derivative(Debug)]
@@ -18,7 +21,7 @@ pub struct Logger {
 }
 
 impl Logger {
-    pub fn new() -> Fallible<Self> {
+    pub fn new() -> Result<Self> {
         let level = LevelFilter::Warn;
         let path = None;
 
@@ -31,7 +34,7 @@ impl Logger {
         })
     }
 
-    pub fn update_settings(&mut self, level: LevelFilter, path: Option<PathBuf>) -> Fallible<()> {
+    pub fn update_settings(&mut self, level: LevelFilter, path: Option<PathBuf>) -> Result<()> {
         let config = create_config(&path, level)?;
         self.handle.set_config(config);
         self.level = level;
@@ -39,7 +42,7 @@ impl Logger {
         Ok(())
     }
 
-    pub fn set_level(&mut self, level: LevelFilter) -> Fallible<()> {
+    pub fn set_level(&mut self, level: LevelFilter) -> Result<()> {
         let config = create_config(&self.path, level)?;
         self.handle.set_config(config);
         self.level = level;
@@ -47,7 +50,7 @@ impl Logger {
     }
 
     #[allow(dead_code)]
-    pub fn set_path(&mut self, path: Option<PathBuf>) -> Fallible<()> {
+    pub fn set_path(&mut self, path: Option<PathBuf>) -> Result<()> {
         let config = create_config(&path, self.level)?;
         self.handle.set_config(config);
         self.path = path;
@@ -55,7 +58,7 @@ impl Logger {
     }
 }
 
-fn create_config(path: &Option<PathBuf>, level: LevelFilter) -> Fallible<Config> {
+fn create_config(path: &Option<PathBuf>, level: LevelFilter) -> Result<Config> {
     let encoder =
         PatternEncoder::new("{date(%H:%M:%S)} {level} {thread} {file}:{line} {message}{n}");
 
@@ -73,7 +76,7 @@ fn create_config(path: &Option<PathBuf>, level: LevelFilter) -> Fallible<Config>
                 .write(true)
                 .truncate(true)
                 .open(&path)
-                .with_context(|err| format!("Failed to open file ({}): {}", path, err))?;
+                .with_context(|| format!("Failed to open file ({})", path))?;
             #[allow(clippy::write_literal)]
             writeln!(
                 f,

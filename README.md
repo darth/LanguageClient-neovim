@@ -4,9 +4,9 @@
 
 [![CircleCI](https://circleci.com/gh/autozimu/LanguageClient-neovim.svg?style=svg)](https://circleci.com/gh/autozimu/LanguageClient-neovim)
 
-[Language Server Protocol] (LSP) support for [vim] and [neovim].
+[Language Server Protocol](LSP) support for [vim] and [neovim].
 
-[Language Server Protocol]: https://github.com/Microsoft/language-server-protocol
+[language server protocol]: https://github.com/Microsoft/language-server-protocol
 [neovim]: https://neovim.io/
 [vim]: http://www.vim.org/
 
@@ -58,24 +58,26 @@ let g:LanguageClient_serverCommands = {
     \ 'ruby': ['~/.rbenv/shims/solargraph', 'stdio'],
     \ }
 
-nnoremap <F5> :call LanguageClient_contextMenu()<CR>
+" note that if you are using Plug mapping you should not use `noremap` mappings.
+nmap <F5> <Plug>(lcn-menu)
 " Or map each action separately
-nnoremap <silent> K :call LanguageClient#textDocument_hover()<CR>
-nnoremap <silent> gd :call LanguageClient#textDocument_definition()<CR>
-nnoremap <silent> <F2> :call LanguageClient#textDocument_rename()<CR>
+nmap <silent>K <Plug>(lcn-hover)
+nmap <silent> gd <Plug>(lcn-definition)
+nmap <silent> <F2> <Plug>(lcn-rename)
 ```
 
 Run command `nvim +PlugInstall +UpdateRemotePlugins +qa` in shell to install
 this plugin. Install corresponding language servers. Restart neovim/vim and
 language services will be available right away. Happy hacking!
 
+# Mappings
+
+LanguageClient-neovim defines various Plug mappings, see `:help LanguageClientMappings` for a full
+list and an example configuration.
+
 # Install
 
-[INSTALL](INSTALL.md)
-
-# Troubleshooting
-
-[Troubleshooting](INSTALL.md#troubleshooting)
+[Full installation steps](INSTALL.md)
 
 # Language Servers
 
@@ -86,20 +88,8 @@ to install them, please see <http://langserver.org> and/or
 
 # Documentation
 
-[`:help LanguageClient`][LanguageClient.txt] for full list of configurations, commands and functions.
-
-[LanguageClient.txt]: doc/LanguageClient.txt
-
-# Changelog
-
-See [Updates]. Subscribe the issue if you want to receive notifications.
-
-[Updates]: https://github.com/autozimu/LanguageClient-neovim/issues/35
-
-# Contributing
-
-[CONTRIBUTING](.github/CONTRIBUTING.md)
-
-# License
-
-The MIT License.
+- [`:help LanguageClient`](doc/LanguageClient.txt)
+- [Changelog](CHANGELOG.md)
+- [Troubleshooting](INSTALL.md#troubleshooting)
+- [Contributing](.github/CONTRIBUTING.md)
+- [The MIT License](LICENSE.txt)

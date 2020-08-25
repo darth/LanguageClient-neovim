@@ -8,10 +8,11 @@ CONTENTS                                               *LanguageClientContents*
 2. Configuration ............... |LanguageClientConfiguration|
 3. Commands .................... |LanguageClientCommands|
 4. Functions ................... |LanguageClientFunctions|
-5. Events ...................... |LanguageClientEvents|
-6. License ..................... |LanguageClientLicense|
-7. Bugs ........................ |LanguageClientBugs|
-8. Contributing ................ |LanguageClientContributing|
+5. Mappings .................... |LanguageClientMappings|
+6. Events ...................... |LanguageClientEvents|
+7. License ..................... |LanguageClientLicense|
+8. Bugs ........................ |LanguageClientBugs|
+9. Contributing ................ |LanguageClientContributing|
 
 ==============================================================================
 1. Usage                                                 *LanguageClientUsage*
@@ -163,13 +164,30 @@ Default: 1.
 Selection UI used when there are multiple entries.
 
 Default: If fzf is loaded, use "fzf", otherwise use "location-list".
-Valid options: "fzf" | "quickfix" | "location-list"
+Valid options: "fzf" | "quickfix" | "location-list" | |Funcref|
+
+If you use a |Funcref|, the referenced function should have two arguments
+(source, sink). The "source" argument can be either a command string or a
+list. The sink argument can be a command string or a |Funcref| that takes the
+selected line as its first argument.
+
+An example implementation is "s:FZF()" in autoload/LanguageClient.vim. For
+details, see the source and sink arguments of fzf#run():
+https://github.com/junegunn/fzf/blob/master/README-VIM.md#fzfrun
+
+Another example, this time using vim-clap: >
+
+	function! MySelectionUI(source, sink) abort
+		return clap#run({'id': 'LCN', 'source': a:source, 'sink': a:sink})
+	endfunction
+
+	let g:LanguageClient_selectionUI = function('MySelectionUI')
 
 2.7 g:LanguageClient_selectionUI_autoOpen                *LanguageClient_selectionUI_autoOpen*
 Selection UI auto open when selectionUI is not "fzf"
 
-Valid options: 1 | 0
 Default: 1
+Valid options: 1 | 0
 
 2.8 g:LanguageClient_trace                           *g:LanguageClient_trace*
 
@@ -303,9 +321,11 @@ Controls how hover output is displayed. Must be one of the following:
 Default: "Auto"
 Valid options: "Never", "Auto", "Always"
 
-2.22 g:LanguageClient_fzfContextMenu         *g:LanguageClient_fzfContextMenu*
+2.22 g:LanguageClient_selectionUIContextMenu *g:LanguageClient_selectionUIContextMenu* *g:LanguageClient_fzfContextMenu*
 
-Should FZF be used for `LanguageClient_contextMenu()`.
+Should the selection UI be used for `LanguageClient_contextMenu()`.
+
+(Alias for the deprecated `LanguageClient_fzfContextMenu`)
 
 Default: 1
 Valid options: 1 | 0
@@ -503,7 +523,7 @@ Example configuration for eclipse.jdt.ls:
      highlight! JavaMemberVariable ctermfg=White cterm=italic guifg=White gui=italic
 
 
-2.33 g:LanguageClient_applyCompletionAdditionalTextEdits *g:LanguageClient__applyCompletionAdditionalTextEdits*
+2.33 g:LanguageClient_applyCompletionAdditionalTextEdits *g:LanguageClient_applyCompletionAdditionalTextEdits*
 
 Indicates whether completionItem additional text edits should be applied.
 
@@ -541,6 +561,20 @@ This setting may have no effect of the server decides not to honour it.
 
 Default: v:null
 Valid options: Array<String>
+
+2.35 g:LanguageClient_floatingWindowStyle  *g:LanguageClient_floatingWindowStyle*
+
+Style of opened Neovim floating window.
+
+Default: 'minimal'
+Valid options: 'minimal'
+
+2.36 g:LanguageClient_hideVirtualTextsOnInsert *g:LanguageClient_hideVirtualTextsOnInsert*
+
+Hides all virtual texts for the current buffer while editing in insert mode.
+
+Default: 0
+Valid options: 1 | 0
 
 ==============================================================================
 3. Commands                                           *LanguageClientCommands*
@@ -679,6 +713,12 @@ If optional dependency FZF is installed, locations will be displayed in a FZF
 prompt, selecting one of the entry will then goto the reference location.
 
 For Denite users, a source with name 'references' is provided.
+
+*LanguageClient#textDocument_visualCodeAction()*
+*LanguageClient_textDocument_visualCodeAction()*
+Signature: LanguageClient#textDocument_visualCodeAction(...)
+
+Show code actions at current visual selection.
 
 *LanguageClient#textDocument_codeAction()*
 *LanguageClient_textDocument_codeAction()*
@@ -866,16 +906,71 @@ Signature: LanguageClient#debugInfo(...)
 Print out debug info.
 
 ==============================================================================
-5. Events                                               *LanguageClientEvents*
+5. Mappings                                           *LanguageClientMappings*
+
+LanguageClient provides various Plug mappings which can be used to set up
+custom mappings. For example, to create a mapping to call the rename function
+you would create a custom mapping like this:
+
+  nmap <silent><F2> <Plug>(lcn-rename)
+
+The full list of Plug mappings is:
+
+*(lcn-menu)*
+Calls LanguageClient_contextMenu.
+
+*(lcn-hover)*
+Calls LanguageClient_textDocument_hover.
+
+*(lcn-rename)*
+Calls LanguageClient_textDocument_rename.
+
+*(lcn-definition)*
+Calls LanguageClient_textDocument_definition.
+
+*(lcn-type-definition)*
+Calls LanguageClient_textDocument_typeDefinition.
+
+*(lcn-references)*
+Calls LanguageClient_textDocument_references.
+
+*(lcn-implementation)*
+Calls LanguageClient_textDocument_implementation.
+
+*(lcn-code-action)*
+Calls LanguageClient_textDocument_codeAction if called in normal model or
+LanguageClient_textDocument_visualCodeAction if called in visual mode.
+
+*(lcn-code-lens-action)*
+Calls LanguageClient_handleCodeLensAction.
+
+*(lcn-symbols)*
+Calls LanguageClient_textDocument_documentSymbol.
+
+*(lcn-highlight)*
+Calls LanguageClient_textDocument_documentHighlight.
+
+*(lcn-explain-error)*
+Calls LanguageClient_textDocument_explainErrorAtPoint.
+
+*(lcn-format)*
+Calls LanguageClient_textDocument_formatting.
+
+*(lcn-format-sync)*
+Calls LanguageClient_textDocument_formatting_sync.
+
+
+==============================================================================
+6. Events                                               *LanguageClientEvents*
 
 LanguageClient provides two events for use with |User| |autocmd|s.
 
-5.1 LanguageClientStarted
+6.1 LanguageClientStarted
 *LanguageClientStarted*
 
 This event is triggered after LanguageClient has successfully started.
 
-5.2 LanguageClientStopped
+6.2 LanguageClientStopped
 *LanguageClientStopped*
 
 This event is triggered after LanguageClient has stopped.
@@ -887,23 +982,23 @@ Example: >
     autocmd User LanguageClientStopped setlocal signcolumn=auto
   augroup END
 
-5.3 LanguageClientDiagnosticsChanged
+6.3 LanguageClientDiagnosticsChanged
 *LanguageClientDiagnosticsChanged*
 
 This event is triggered when diagnostics changed.
 
-5.4 LanguageClientTextDocumentDidOpenPost
+6.4 LanguageClientTextDocumentDidOpenPost
 *LanguageClientTextDocumentDidOpenPost*
 
 Triggered after textDocument/didOpen notification is sent to language server.
 
 ==============================================================================
-6. License                                             *LanguageClientLicense*
+7. License                                             *LanguageClientLicense*
 
 The MIT License.
 
 ==============================================================================
-7. Bugs                                                   *LanguageClientBugs*
+8. Bugs                                                   *LanguageClientBugs*
 
 Please report all bugs at https://github.com/autozimu/LanguageClient-neovim/issues
 
@@ -924,7 +1019,7 @@ which can work like a proxy and logs all stdin and stdout of the language
 server into a log file.
 
 ==============================================================================
-8. Contributing                                   *LanguageClientContributing*
+9. Contributing                                   *LanguageClientContributing*
 
 https://github.com/autozimu/LanguageClient-neovim
 

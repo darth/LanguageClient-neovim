@@ -1,34 +1,77 @@
-use super::*;
-
+use crate::extensions::{java, rust_analyzer};
 use crate::language_client::LanguageClient;
-use crate::lsp::notification::Notification;
-use crate::lsp::request::GotoDefinitionResponse;
-use crate::lsp::request::Request;
-use crate::rpcclient::RpcClient;
-use failure::err_msg;
+use crate::vim::{try_get, Mode};
+use crate::{
+    rpcclient::RpcClient,
+    types::*,
+    utils::{
+        apply_text_edits, code_action_kind_as_str, convert_to_vim_str, decode_parameter_label,
+        escape_single_quote, expand_json_path, get_default_initialization_options, get_root_path,
+        vim_cmd_args_to_value, Canonicalize, Combine, ToUrl,
+    },
+    viewport,
+};
+use anyhow::{anyhow, Context, Error, Result};
 use itertools::Itertools;
+use jsonrpc_core::Value;
+use log::{debug, error, info, warn};
+use lsp_types::notification::Notification;
+use lsp_types::request::Request;
+use lsp_types::{
+    code_action_kind, ApplyWorkspaceEditParams, ApplyWorkspaceEditResponse, ClientCapabilities,
+    ClientInfo, CodeAction, CodeActionCapability, CodeActionContext, CodeActionKindLiteralSupport,
+    CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams, CodeActionResponse, CodeLens,
+    Command, CompletionCapability, CompletionItem, CompletionItemCapability, CompletionResponse,
+    CompletionTextEdit, Diagnostic, DiagnosticSeverity, DidChangeConfigurationParams,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentChangeOperation, DocumentChanges,
+    DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind,
+    DocumentRangeFormattingParams, DocumentSymbolParams, ExecuteCommandParams, FormattingOptions,
+    GenericCapability, GotoCapability, GotoDefinitionResponse, Hover, HoverCapability,
+    InitializeParams, InitializeResult, InitializedParams, Location, LogMessageParams, MarkupKind,
+    MessageType, NumberOrString, ParameterInformation, ParameterInformationSettings,
+    PartialResultParams, Position, ProgressParams, ProgressParamsValue,
+    PublishDiagnosticsCapability, PublishDiagnosticsParams, Range, ReferenceContext,
+    RegistrationParams, RenameParams, ResourceOp, SemanticHighlightingClientCapability,
+    SemanticHighlightingParams, ShowMessageParams, ShowMessageRequestParams, SignatureHelp,
+    SignatureHelpCapability, SignatureInformationSettings, SymbolInformation,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, TextEdit, TraceOption, UnregistrationParams,
+    VersionedTextDocumentIdentifier, WorkDoneProgress, WorkDoneProgressParams,
+    WorkspaceClientCapabilities, WorkspaceEdit, WorkspaceSymbolParams,
+};
+use maplit::hashmap;
 use notify::Watcher;
-use std::sync::mpsc;
-use vim::try_get;
+use serde::de::Deserialize;
+use serde_json::json;
+use std::{
+    collections::HashMap,
+    fs::{read_to_string, File},
+    io::{BufRead, BufReader, BufWriter},
+    net::TcpStream,
+    path::{Path, PathBuf},
+    process::Stdio,
+    str::FromStr,
+    sync::{mpsc, Arc, MutexGuard},
+    thread,
+    time::{Duration, Instant},
+};
 
 impl LanguageClient {
-    pub fn get_client(&self, lang_id: &LanguageId) -> Fallible<Arc<RpcClient>> {
-        self.get(|state| state.clients.get(lang_id).cloned())?
+    pub fn get_client(&self, language_id: &LanguageId) -> Result<Arc<RpcClient>> {
+        self.get(|state| state.clients.get(language_id).cloned())?
             .ok_or_else(|| {
                 LCError::ServerNotRunning {
-                    languageId: lang_id.clone().unwrap_or_default(),
+                    language_id: language_id.clone().unwrap_or_default(),
                 }
                 .into()
             })
     }
 
-    pub fn loop_call(&self, rx: &crossbeam::channel::Receiver<Call>) -> Fallible<()> {
+    pub fn loop_call(&self, rx: &crossbeam::channel::Receiver<Call>) -> Result<()> {
         for call in rx.iter() {
-            let language_client = LanguageClient {
-                version: self.version.clone(),
-                state_mutex: self.state_mutex.clone(),
-                clients_mutex: self.clients_mutex.clone(), // not sure if useful to clone this
-            };
+            let language_client = self.clone();
             thread::spawn(move || {
                 if let Err(err) = language_client.handle_call(call) {
                     error!("Error handling request:\n{:?}", err);
@@ -40,9 +83,9 @@ impl LanguageClient {
     }
 
     /////// Utils ///////
-    fn sync_settings(&self) -> Fallible<()> {
+    fn sync_settings(&self) -> Result<()> {
         info!("Begin sync settings");
-        let (loggingFile, loggingLevel, serverStderr): (
+        let (logging_file, logging_level, server_stderr): (
             Option<PathBuf>,
             log::LevelFilter,
             Option<String>,
@@ -54,25 +97,25 @@ impl LanguageClient {
             ]
             .as_ref(),
         )?;
-        self.update(|state| state.logger.update_settings(loggingLevel, loggingFile))?;
+        self.update(|state| state.logger.update_settings(logging_level, logging_file))?;
 
         #[allow(clippy::type_complexity)]
         let (
-            autoStart,
-            serverCommands,
-            selectionUI,
+            auto_start,
+            server_commands,
+            selection_ui,
             trace,
-            settingsPath,
-            loadSettings,
-            rootMarkers,
+            settings_path,
+            load_settings,
+            root_markers,
             change_throttle,
             wait_output_timeout,
-            diagnosticsEnable,
-            diagnosticsList,
-            diagnosticsDisplay,
-            windowLogMessageLevel,
-            hoverPreview,
-            completionPreferTextEdit,
+            diagnostics_enable,
+            diagnostics_list,
+            diagnostics_display,
+            window_log_message_level,
+            hover_preview,
+            completion_prefer_text_edit,
             is_nvim,
         ): (
             u64,
@@ -95,7 +138,7 @@ impl LanguageClient {
             [
                 "!!get(g:, 'LanguageClient_autoStart', 1)",
                 "s:GetVar('LanguageClient_serverCommands', {})",
-                "get(g:, 'LanguageClient_selectionUI', v:null)",
+                "s:getSelectionUI()",
                 "get(g:, 'LanguageClient_trace', v:null)",
                 "map(s:ToList(get(g:, 'LanguageClient_settingsPath', '.vim/settings.json')), 'expand(v:val)')",
                 "!!get(g:, 'LanguageClient_loadSettings', 1)",
@@ -115,16 +158,17 @@ impl LanguageClient {
 
         #[allow(clippy::type_complexity)]
         let (
-            diagnosticsSignsMax,
+            diagnostics_signs_max,
             diagnostics_max_severity,
-            documentHighlightDisplay,
-            selectionUI_autoOpen,
+            document_highlight_display,
+            selection_ui_auto_open,
             use_virtual_text,
             echo_project_root,
-            semanticHighlightMaps,
-            semanticScopeSeparator,
-            applyCompletionAdditionalTextEdits,
+            semantic_highlight_maps,
+            semantic_scope_separator,
+            apply_completion_text_edits,
             preferred_markup_kind,
+            hide_virtual_texts_on_insert,
         ): (
             Option<usize>,
             String,
@@ -136,6 +180,7 @@ impl LanguageClient {
             String,
             u8,
             Option<Vec<MarkupKind>>,
+            u8,
         ) = self.vim()?.eval(
             [
                 "get(g:, 'LanguageClient_diagnosticsSignsMax', v:null)",
@@ -148,30 +193,30 @@ impl LanguageClient {
                 "s:GetVar('LanguageClient_semanticScopeSeparator', ':')",
                 "get(g:, 'LanguageClient_applyCompletionAdditionalTextEdits', 1)",
                 "get(g:, 'LanguageClient_preferredMarkupKind', v:null)",
+                "s:GetVar('LanguageClient_hideVirtualTextsOnInsert', 0)",
             ]
             .as_ref(),
         )?;
 
         // vimscript use 1 for true, 0 for false.
-        let autoStart = autoStart == 1;
-        let selectionUI_autoOpen = selectionUI_autoOpen == 1;
-        let loadSettings = loadSettings == 1;
+        let auto_start = auto_start == 1;
+        let selection_ui_auto_open = selection_ui_auto_open == 1;
+        let load_settings = load_settings == 1;
 
-        let trace = if let Some(t) = trace {
-            match t.to_ascii_uppercase().as_str() {
+        let trace = match trace {
+            Some(t) => match t.to_ascii_uppercase().as_str() {
                 "OFF" => Some(TraceOption::Off),
                 "MESSAGES" => Some(TraceOption::Messages),
                 "VERBOSE" => Some(TraceOption::Verbose),
-                _ => bail!("Invalid option for LanguageClient_trace: {}", t),
-            }
-        } else {
-            Some(TraceOption::default())
+                _ => return Err(anyhow!("Invalid option for LanguageClient_trace: {}", t)),
+            },
+            None => Some(TraceOption::default()),
         };
 
-        let selectionUI = if let Some(s) = selectionUI {
+        let selection_ui = if let Some(s) = selection_ui {
             SelectionUI::from_str(&s)?
         } else if self.vim()?.eval::<_, i64>("get(g:, 'loaded_fzf')")? == 1 {
-            SelectionUI::FZF
+            SelectionUI::Funcref
         } else {
             SelectionUI::default()
         };
@@ -180,33 +225,35 @@ impl LanguageClient {
         let wait_output_timeout =
             Duration::from_millis((wait_output_timeout.unwrap_or(10.0) * 1000.0) as u64);
 
-        let diagnosticsEnable = diagnosticsEnable == 1;
+        let diagnostics_enable = diagnostics_enable == 1;
 
-        let diagnosticsList = if let Some(s) = diagnosticsList {
+        let diagnostics_list = if let Some(s) = diagnostics_list {
             DiagnosticsList::from_str(&s)?
         } else {
             DiagnosticsList::Disabled
         };
 
-        let windowLogMessageLevel = match windowLogMessageLevel.to_ascii_uppercase().as_str() {
+        let window_log_level = match window_log_message_level.to_ascii_uppercase().as_str() {
             "ERROR" => MessageType::Error,
             "WARNING" => MessageType::Warning,
             "INFO" => MessageType::Info,
             "LOG" => MessageType::Log,
-            _ => bail!(
-                "Invalid option for LanguageClient_windowLogMessageLevel: {}",
-                windowLogMessageLevel
-            ),
+            _ => {
+                return Err(anyhow!(
+                    "Invalid option for LanguageClient_windowLogMessageLevel: {}",
+                    window_log_message_level
+                ))
+            }
         };
 
-        let hoverPreview = if let Some(s) = hoverPreview {
+        let hover_preview = if let Some(s) = hover_preview {
             HoverPreviewOption::from_str(&s)?
         } else {
             HoverPreviewOption::Auto
         };
 
-        let completionPreferTextEdit = completionPreferTextEdit == 1;
-        let applyCompletionAdditionalTextEdits = applyCompletionAdditionalTextEdits == 1;
+        let prefer_text_edit = completion_prefer_text_edit == 1;
+        let apply_completion_edits = apply_completion_text_edits == 1;
 
         let is_nvim = is_nvim == 1;
 
@@ -216,76 +263,78 @@ impl LanguageClient {
             "WARNING" => DiagnosticSeverity::Warning,
             "INFORMATION" => DiagnosticSeverity::Information,
             "HINT" => DiagnosticSeverity::Hint,
-            _ => bail!(
-                "Invalid option for LanguageClient_diagnosticsMaxSeverity: {}",
-                diagnostics_max_severity
-            ),
+            _ => {
+                return Err(anyhow!(
+                    "Invalid option for LanguageClient_diagnosticsMaxSeverity: {}",
+                    diagnostics_max_severity
+                ))
+            }
         };
 
-        let semanticHlUpdateLanguageIds: Vec<String> =
-            semanticHighlightMaps.keys().cloned().collect();
+        let semantic_highlight_language_ids: Vec<String> =
+            semantic_highlight_maps.keys().cloned().collect();
 
         self.update(|state| {
-            state.autoStart = autoStart;
-            state.semanticHighlightMaps = semanticHighlightMaps;
-            state.semanticScopeSeparator = semanticScopeSeparator;
+            state.auto_start = auto_start;
+            state.semantic_highlight_maps = semantic_highlight_maps;
+            state.semantic_scope_separator = semantic_scope_separator;
             state.semantic_scope_to_hl_group_table.clear();
-            state.serverCommands.extend(serverCommands);
-            state.selectionUI = selectionUI;
-            state.selectionUI_autoOpen = selectionUI_autoOpen;
+            state.server_commands.extend(server_commands);
+            state.selection_ui = selection_ui;
+            state.selection_ui_auto_open = selection_ui_auto_open;
             state.trace = trace;
-            state.diagnosticsEnable = diagnosticsEnable;
-            state.diagnosticsList = diagnosticsList;
-            state.diagnosticsDisplay = serde_json::from_value(
-                serde_json::to_value(&state.diagnosticsDisplay)?.combine(&diagnosticsDisplay),
+            state.diagnostics_enable = diagnostics_enable;
+            state.diagnostics_list = diagnostics_list;
+            state.diagnostics_display = serde_json::from_value(
+                serde_json::to_value(&state.diagnostics_display)?.combine(&diagnostics_display),
             )?;
-            state.diagnosticsSignsMax = diagnosticsSignsMax;
+            state.diagnostics_signs_max = diagnostics_signs_max;
             state.diagnostics_max_severity = diagnostics_max_severity;
-            state.documentHighlightDisplay = serde_json::from_value(
-                serde_json::to_value(&state.documentHighlightDisplay)?
-                    .combine(&documentHighlightDisplay),
+            state.document_highlight_display = serde_json::from_value(
+                serde_json::to_value(&state.document_highlight_display)?
+                    .combine(&document_highlight_display),
             )?;
-            state.windowLogMessageLevel = windowLogMessageLevel;
-            state.settingsPath = settingsPath;
-            state.loadSettings = loadSettings;
-            state.rootMarkers = rootMarkers;
+            state.window_log_message_level = window_log_level;
+            state.settings_path = settings_path;
+            state.load_settings = load_settings;
+            state.root_markers = root_markers;
             state.change_throttle = change_throttle;
             state.wait_output_timeout = wait_output_timeout;
-            state.hoverPreview = hoverPreview;
-            state.completionPreferTextEdit = completionPreferTextEdit;
-            state.applyCompletionAdditionalTextEdits = applyCompletionAdditionalTextEdits;
+            state.hover_preview = hover_preview;
+            state.completion_prefer_text_edit = prefer_text_edit;
+            state.apply_completion_additional_text_edits = apply_completion_edits;
             state.use_virtual_text = use_virtual_text;
+            state.hide_virtual_texts_on_insert = hide_virtual_texts_on_insert == 1;
             state.echo_project_root = echo_project_root == 1;
-            state.serverStderr = serverStderr;
+            state.server_stderr = server_stderr;
             state.is_nvim = is_nvim;
             state.preferred_markup_kind = preferred_markup_kind;
             Ok(())
         })?;
 
-        for languageId in semanticHlUpdateLanguageIds {
-            self.updateSemanticHighlightTables(&languageId)?;
+        for language_id in semantic_highlight_language_ids {
+            self.update_semantic_highlight_tables(&language_id)?;
         }
 
         info!("End sync settings");
         Ok(())
     }
 
-    fn get_workspace_settings(&self, root: &str) -> Fallible<Value> {
-        if !self.get(|state| state.loadSettings)? {
+    fn get_workspace_settings(&self, root: &str) -> Result<Value> {
+        if !self.get(|state| state.load_settings)? {
             return Ok(Value::Null);
         }
 
         let mut res = Value::Null;
         let mut last_err = None;
         let mut at_least_one_success = false;
-        for orig_path in self.get(|state| state.settingsPath.clone())? {
+        for orig_path in self.get(|state| state.settings_path.clone())? {
             let path = Path::new(root).join(orig_path);
-            let buffer = read_to_string(&path).with_context(|err| {
-                format!("Failed to read file ({}): {}", path.to_string_lossy(), err)
-            });
+            let buffer = read_to_string(&path)
+                .with_context(|| format!("Failed to read file ({})", path.to_string_lossy()));
             let buffer = match buffer {
                 Err(e) => {
-                    last_err = Some(e.into());
+                    last_err = Some(e);
                     continue;
                 }
                 Ok(x) => x,
@@ -310,14 +359,17 @@ impl LanguageClient {
         }
     }
 
-    fn define_signs(&self) -> Fallible<()> {
+    fn define_signs(&self) -> Result<()> {
         info!("Defining signs");
 
         let mut cmds = vec![];
-        for entry in self.get(|state| state.diagnosticsDisplay.clone())?.values() {
+        for entry in self
+            .get(|state| state.diagnostics_display.clone())?
+            .values()
+        {
             cmds.push(format!(
                 "sign define LanguageClient{} text={} texthl={}",
-                entry.name, entry.signText, entry.signTexthl,
+                entry.name, entry.sign_text, entry.sign_texthl,
             ));
         }
 
@@ -325,9 +377,7 @@ impl LanguageClient {
         Ok(())
     }
 
-    fn apply_WorkspaceEdit(&self, edit: &WorkspaceEdit) -> Fallible<()> {
-        use self::{DocumentChangeOperation::*, ResourceOp::*};
-
+    pub fn apply_workspace_edit(&self, edit: &WorkspaceEdit) -> Result<()> {
         debug!("Begin apply WorkspaceEdit: {:?}", edit);
         let mut filename = self.vim()?.get_filename(&Value::Null)?;
         let mut position = self.vim()?.get_position(&Value::Null)?;
@@ -336,7 +386,7 @@ impl LanguageClient {
             match changes {
                 DocumentChanges::Edits(ref changes) => {
                     for e in changes {
-                        position = self.apply_TextEdits(
+                        position = self.apply_text_edits(
                             &e.text_document.uri.filepath()?,
                             &e.edits,
                             position,
@@ -346,20 +396,24 @@ impl LanguageClient {
                 DocumentChanges::Operations(ref ops) => {
                     for op in ops {
                         match op {
-                            Edit(ref e) => {
-                                position = self.apply_TextEdits(
+                            DocumentChangeOperation::Edit(ref e) => {
+                                position = self.apply_text_edits(
                                     &e.text_document.uri.filepath()?,
                                     &e.edits,
                                     position,
                                 )?
                             }
-                            Op(ref rop) => match rop {
-                                Create(file) => {
+                            DocumentChangeOperation::Op(ref rop) => match rop {
+                                ResourceOp::Create(file) => {
                                     filename = file.uri.filepath()?.to_string_lossy().into_owned();
                                     position = Position::default();
                                 }
-                                Rename(_file) => bail!("file renaming not yet supported."),
-                                Delete(_file) => bail!("file deletion not yet supported."),
+                                ResourceOp::Rename(_file) => {
+                                    return Err(anyhow!("file renaming not yet supported."));
+                                }
+                                ResourceOp::Delete(_file) => {
+                                    return Err(anyhow!("file deletion not yet supported."));
+                                }
                             },
                         }
                     }
@@ -367,7 +421,7 @@ impl LanguageClient {
             }
         } else if let Some(ref changes) = edit.changes {
             for (uri, edits) in changes {
-                position = self.apply_TextEdits(&uri.filepath()?, edits, position)?;
+                position = self.apply_text_edits(&uri.filepath()?, edits, position)?;
             }
         }
         self.edit(&None, &filename)?;
@@ -377,15 +431,18 @@ impl LanguageClient {
         Ok(())
     }
 
-    pub fn textDocument_documentHighlight(&self, params: &Value) -> Fallible<Value> {
-        self.textDocument_didChange(params)?;
-        info!("Begin {}", lsp::request::DocumentHighlightRequest::METHOD);
+    pub fn text_document_document_highlight(&self, params: &Value) -> Result<Value> {
+        self.text_document_did_change(params)?;
+        info!(
+            "Begin {}",
+            lsp_types::request::DocumentHighlightRequest::METHOD
+        );
         let filename = self.vim()?.get_filename(&Value::Null)?;
-        let languageId = self.vim()?.get_languageId(&filename, &Value::Null)?;
+        let language_id = self.vim()?.get_language_id(&filename, &Value::Null)?;
         let position = self.vim()?.get_position(&Value::Null)?;
 
-        let result = self.get_client(&Some(languageId))?.call(
-            lsp::request::DocumentHighlightRequest::METHOD,
+        let result = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::DocumentHighlightRequest::METHOD,
             TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
                     uri: filename.to_url()?,
@@ -401,8 +458,8 @@ impl LanguageClient {
         let document_highlight: Option<Vec<DocumentHighlight>> =
             serde_json::from_value(result.clone())?;
         if let Some(document_highlight) = document_highlight {
-            let documentHighlightDisplay =
-                self.get(|state| state.documentHighlightDisplay.clone())?;
+            let document_highlight_display =
+                self.get(|state| state.document_highlight_display.clone())?;
             let highlights = document_highlight
                 .into_iter()
                 .map(|DocumentHighlight { range, kind }| {
@@ -410,20 +467,20 @@ impl LanguageClient {
                         line: range.start.line,
                         character_start: range.start.character,
                         character_end: range.end.character,
-                        group: documentHighlightDisplay
+                        group: document_highlight_display
                             .get(
                                 &kind
                                     .unwrap_or(DocumentHighlightKind::Text)
                                     .to_int()
                                     .unwrap(),
                             )
-                            .ok_or_else(|| err_msg("Failed to get display"))?
+                            .ok_or_else(|| anyhow!("Failed to get display"))?
                             .texthl
                             .clone(),
                         text: String::new(),
                     })
                 })
-                .collect::<Fallible<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?;
 
             let buffer = self.vim()?.get_bufnr(&filename, params)?;
 
@@ -474,12 +531,15 @@ impl LanguageClient {
             })?;
         }
 
-        info!("End {}", lsp::request::DocumentHighlightRequest::METHOD);
+        info!(
+            "End {}",
+            lsp_types::request::DocumentHighlightRequest::METHOD
+        );
         Ok(result)
     }
 
-    pub fn languageClient_clearDocumentHighlight(&self, _params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__ClearDocumentHighlight);
+    pub fn clear_document_highlight(&self, _params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_CLEAR_DOCUMENT_HL);
 
         // The following code needs to be inside the critical section as a whole to update
         // everything correctly and not leave hanging highlights.
@@ -494,16 +554,16 @@ impl LanguageClient {
             Ok(())
         })?;
 
-        info!("End {}", NOTIFICATION__ClearDocumentHighlight);
+        info!("End {}", NOTIFICATION_CLEAR_DOCUMENT_HL);
         Ok(())
     }
 
-    fn apply_TextEdits<P: AsRef<Path>>(
+    fn apply_text_edits<P: AsRef<Path>>(
         &self,
         path: P,
         edits: &[TextEdit],
         position: Position,
-    ) -> Fallible<Position> {
+    ) -> Result<Position> {
         debug!("Begin apply TextEdits: {:?}", edits);
         if edits.is_empty() {
             return Ok(position);
@@ -529,7 +589,7 @@ impl LanguageClient {
             lines.push("".to_owned());
         }
 
-        let (mut lines, position) = apply_TextEdits(&lines, &edits, &position)?;
+        let (mut lines, position) = apply_text_edits(&lines, &edits, &position)?;
 
         if lines.last().map(String::is_empty) == Some(true) && fixendofline {
             lines.pop();
@@ -543,7 +603,7 @@ impl LanguageClient {
         Ok(position)
     }
 
-    fn update_quickfixlist(&self) -> Fallible<()> {
+    fn update_quickfixlist(&self) -> Result<()> {
         let diagnostics = self.get(|state| state.diagnostics.clone())?;
         let qflist: Vec<_> = diagnostics
             .iter()
@@ -563,8 +623,8 @@ impl LanguageClient {
             .collect();
 
         let title = "[LC]: diagnostics";
-        let diagnosticsList = self.get(|state| state.diagnosticsList)?;
-        match diagnosticsList {
+        let diagnostics_list = self.get(|state| state.diagnostics_list)?;
+        match diagnostics_list {
             DiagnosticsList::Quickfix => {
                 self.vim()?.setqflist(&qflist, "r", title)?;
             }
@@ -577,7 +637,7 @@ impl LanguageClient {
         Ok(())
     }
 
-    fn process_diagnostics(&self, filename: &str, diagnostics: &[Diagnostic]) -> Fallible<()> {
+    fn process_diagnostics(&self, filename: &str, diagnostics: &[Diagnostic]) -> Result<()> {
         if !self.get(|state| state.text_documents.contains_key(filename))? {
             return Ok(());
         }
@@ -617,7 +677,7 @@ impl LanguageClient {
         })?;
 
         // Highlight.
-        let diagnosticsDisplay = self.get(|state| state.diagnosticsDisplay.clone())?;
+        let diagnostics_display = self.get(|state| state.diagnostics_display.clone())?;
 
         let mut highlights = vec![];
         for dn in diagnostics {
@@ -626,9 +686,9 @@ impl LanguageClient {
             let character_end = dn.range.end.character;
 
             let severity = dn.severity.unwrap_or(DiagnosticSeverity::Hint);
-            let group = diagnosticsDisplay
+            let group = diagnostics_display
                 .get(&severity.to_int()?)
-                .ok_or_else(|| err_msg("Failed to get display"))?
+                .ok_or_else(|| anyhow!("Failed to get display"))?
                 .texthl
                 .clone();
             // TODO: handle multi-line range.
@@ -674,9 +734,9 @@ impl LanguageClient {
             let mut new_match_ids = Vec::new();
 
             for (severity, dns) in match_groups {
-                let hl_group = diagnosticsDisplay
+                let hl_group = diagnostics_display
                     .get(&severity)
-                    .ok_or_else(|| err_msg("Failed to get display"))?
+                    .ok_or_else(|| anyhow!("Failed to get display"))?
                     .texthl
                     .clone();
                 let ranges: Vec<Vec<_>> = dns
@@ -693,24 +753,24 @@ impl LanguageClient {
                                 length,
                             ]]
                         } else {
-                            let mut middleLines: Vec<_> = (dn.range.start.line + 1
+                            let mut middle_lines: Vec<_> = (dn.range.start.line + 1
                                 ..dn.range.end.line)
                                 .map(|l| vec![l + 1])
                                 .collect();
-                            let startLine = vec![
+                            let start_line = vec![
                                 dn.range.start.line + 1,
                                 dn.range.start.character + 1,
                                 999_999, //Clear to the end of the line
                             ];
-                            let endLine =
+                            let end_line =
                                 vec![dn.range.end.line + 1, 1, dn.range.end.character + 1];
-                            middleLines.push(startLine);
+                            middle_lines.push(start_line);
                             // For a multi-ringe range ending at the exact start of the last line,
                             // don't highlight the first character of the last line.
                             if dn.range.end.character > 0 {
-                                middleLines.push(endLine);
+                                middle_lines.push(end_line);
                             }
-                            middleLines
+                            middle_lines
                         }
                     })
                     .collect();
@@ -730,83 +790,10 @@ impl LanguageClient {
         Ok(())
     }
 
-    fn display_locations(&self, locations: &[Location], title: &str) -> Fallible<()> {
-        let location_to_quickfix_entry =
-            |state: &Self, loc: &Location| -> Fallible<QuickfixEntry> {
-                let filename = loc.uri.filepath()?.to_string_lossy().into_owned();
-                let start = loc.range.start;
-                let text = state.get_line(&filename, start.line).unwrap_or_default();
-
-                Ok(QuickfixEntry {
-                    filename,
-                    lnum: start.line + 1,
-                    col: Some(start.character + 1),
-                    text: Some(text),
-                    nr: None,
-                    typ: None,
-                })
-            };
-
-        let selectionUI = self.get(|state| state.selectionUI)?;
-        let selectionUI_autoOpen = self.get(|state| state.selectionUI_autoOpen)?;
-        match selectionUI {
-            SelectionUI::FZF => {
-                let cwd: String = self.vim()?.eval("getcwd()")?;
-                let source: Fallible<Vec<_>> = locations
-                    .iter()
-                    .map(|loc| {
-                        let filename = loc.uri.filepath()?;
-                        let start = loc.range.start;
-                        let text = self.get_line(&filename, start.line).unwrap_or_default();
-                        let relpath = diff_paths(&filename, Path::new(&cwd)).unwrap_or(filename);
-                        Ok(format!(
-                            "{}:{}:{}:\t{}",
-                            relpath.to_string_lossy(),
-                            start.line + 1,
-                            start.character + 1,
-                            text
-                        ))
-                    })
-                    .collect();
-                let source = source?;
-
-                self.vim()?.rpcclient.notify(
-                    "s:FZF",
-                    json!([source, format!("s:{}", NOTIFICATION__FZFSinkLocation)]),
-                )?;
-            }
-            SelectionUI::Quickfix => {
-                let list: Fallible<Vec<_>> = locations
-                    .iter()
-                    .map(|loc| location_to_quickfix_entry(self, loc))
-                    .collect();
-                let list = list?;
-                self.vim()?.setqflist(&list, " ", title)?;
-                if selectionUI_autoOpen {
-                    self.vim()?.command("botright copen")?;
-                }
-                self.vim()?.echo("Quickfix list updated.")?;
-            }
-            SelectionUI::LocationList => {
-                let list: Fallible<Vec<_>> = locations
-                    .iter()
-                    .map(|loc| location_to_quickfix_entry(self, loc))
-                    .collect();
-                let list = list?;
-                self.vim()?.setloclist(&list, " ", title)?;
-                if selectionUI_autoOpen {
-                    self.vim()?.command("lopen")?;
-                }
-                self.vim()?.echo("Location list updated.")?;
-            }
-        }
-        Ok(())
-    }
-
-    fn registerCMSource(&self, languageId: &str, result: &Value) -> Fallible<()> {
+    fn register_cm_source(&self, language_id: &str, result: &Value) -> Result<()> {
         info!("Begin register NCM source");
-        let exists_CMRegister: u64 = self.vim()?.eval("exists('g:cm_matcher')")?;
-        if exists_CMRegister == 0 {
+        let exists_cm_register: u64 = self.vim()?.eval("exists('g:cm_matcher')")?;
+        if exists_cm_register == 0 {
             return Ok(());
         }
 
@@ -832,19 +819,19 @@ impl LanguageClient {
         self.vim()?.rpcclient.notify(
             "cm#register_source",
             json!([{
-                "name": format!("LanguageClient_{}", languageId),
+                "name": format!("LanguageClient_{}", language_id),
                 "priority": 9,
-                "scopes": [languageId],
+                "scopes": [language_id],
                 "cm_refresh_patterns": trigger_patterns,
                 "abbreviation": "LC",
-                "cm_refresh": REQUEST__NCMRefresh,
+                "cm_refresh": REQUEST_NCM_REFRESH,
             }]),
         )?;
         info!("End register NCM source");
         Ok(())
     }
 
-    fn registerNCM2Source(&self, languageId: &str, result: &Value) -> Fallible<()> {
+    fn register_ncm2_source(&self, language_id: &str, result: &Value) -> Result<()> {
         info!("Begin register NCM2 source");
         let exists_ncm2: u64 = self.vim()?.eval("exists('g:ncm2_loaded')")?;
         if exists_ncm2 == 0 {
@@ -873,19 +860,19 @@ impl LanguageClient {
         self.vim()?.rpcclient.notify(
             "ncm2#register_source",
             json!([{
-                "name": format!("LanguageClient_{}", languageId),
+                "name": format!("LanguageClient_{}", language_id),
                 "priority": 9,
-                "scope": [languageId],
+                "scope": [language_id],
                 "complete_pattern": trigger_patterns,
                 "mark": "LC",
-                "on_complete": REQUEST__NCM2OnComplete,
+                "on_complete": REQUEST_NCM2_ON_COMPLETE,
             }]),
         )?;
         info!("End register NCM2 source");
         Ok(())
     }
 
-    fn parseSemanticScopes(&self, languageId: &str, result: &Value) -> Fallible<()> {
+    fn parse_semantic_scopes(&self, language_id: &str, result: &Value) -> Result<()> {
         info!("Begin parse Semantic Scopes");
         let result: InitializeResult = serde_json::from_value(result.clone())?;
 
@@ -893,7 +880,7 @@ impl LanguageClient {
             self.update(|state| {
                 state
                     .semantic_scopes
-                    .insert(languageId.into(), capability.scopes.unwrap_or_default());
+                    .insert(language_id.into(), capability.scopes.unwrap_or_default());
                 Ok(())
             })?;
         }
@@ -905,25 +892,25 @@ impl LanguageClient {
     /// Build the Semantic Highlight Lookup Table of
     ///
     /// ScopeIndex -> Option<HighlightGroup>
-    fn updateSemanticHighlightTables(&self, languageId: &str) -> Fallible<()> {
+    fn update_semantic_highlight_tables(&self, language_id: &str) -> Result<()> {
         info!("Begin updateSemanticHighlightTables");
-        let (opt_scopes, opt_hl_map, scopeSeparator) = self.get(|state| {
+        let (opt_scopes, opt_hl_map, scope_separator) = self.get(|state| {
             (
-                state.semantic_scopes.get(languageId).cloned(),
-                state.semanticHighlightMaps.get(languageId).cloned(),
-                state.semanticScopeSeparator.clone(),
+                state.semantic_scopes.get(language_id).cloned(),
+                state.semantic_highlight_maps.get(language_id).cloned(),
+                state.semantic_scope_separator.clone(),
             )
         })?;
 
-        if let (Some(semantic_scopes), Some(semanticHighlightMap)) = (opt_scopes, opt_hl_map) {
+        if let (Some(semantic_scopes), Some(shm)) = (opt_scopes, opt_hl_map) {
             let mut table: Vec<Option<String>> = Vec::new();
 
             for scope_list in semantic_scopes {
                 // Combine all scopes ["scopeA", "scopeB", ...] -> "scopeA:scopeB:..."
-                let scope_str = scope_list.iter().join(&scopeSeparator);
+                let scope_str = scope_list.iter().join(&scope_separator);
 
                 let mut matched = false;
-                for (scope_regex, hl_group) in &semanticHighlightMap {
+                for (scope_regex, hl_group) in &shm {
                     let match_expr = format!(
                         "({} =~ {})",
                         convert_to_vim_str(&scope_str),
@@ -947,12 +934,12 @@ impl LanguageClient {
             self.update(|state| {
                 state
                     .semantic_scope_to_hl_group_table
-                    .insert(languageId.into(), table);
+                    .insert(language_id.into(), table);
                 Ok(())
             })?;
         } else {
             self.update(|state| {
-                state.semantic_scope_to_hl_group_table.remove(languageId);
+                state.semantic_scope_to_hl_group_table.remove(language_id);
                 Ok(())
             })?;
         }
@@ -960,7 +947,7 @@ impl LanguageClient {
         Ok(())
     }
 
-    fn get_line(&self, path: impl AsRef<Path>, line: u64) -> Fallible<String> {
+    pub fn get_line(&self, path: impl AsRef<Path>, line: u64) -> Result<String> {
         let value = self.vim()?.rpcclient.call(
             "getbufline",
             json!([path.as_ref().to_string_lossy(), line + 1]),
@@ -973,98 +960,34 @@ impl LanguageClient {
             text = reader
                 .lines()
                 .nth(line.to_usize()?)
-                .ok_or_else(|| format_err!("Failed to get line! line: {}", line))??;
+                .ok_or_else(|| anyhow!("Failed to get line! line: {}", line))??;
         }
 
         Ok(text.trim().into())
     }
 
-    fn try_handle_command_by_client(&self, cmd: &Command) -> Fallible<bool> {
+    fn try_handle_command_by_client(&self, cmd: &Command) -> Result<bool> {
         match cmd.command.as_str() {
-            "java.apply.workspaceEdit" => {
-                if let Some(ref edits) = cmd.arguments {
-                    for edit in edits {
-                        let edit: WorkspaceEdit = serde_json::from_value(edit.clone())?;
-                        self.apply_WorkspaceEdit(&edit)?;
-                    }
-                }
-            }
-            "rust-analyzer.showReferences" => {
-                let locations = cmd
-                    .arguments
-                    .clone()
-                    .unwrap_or_else(|| vec![])
-                    .get(2)
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(vec![]));
-                let locations: Vec<Location> = serde_json::from_value(locations)?;
+            java::command::APPLY_WORKSPACE_EDIT => self.handle_java_command(cmd),
+            rust_analyzer::command::RUN
+            | rust_analyzer::command::RUN_SINGLE
+            | rust_analyzer::command::SHOW_REFERENCES
+            | rust_analyzer::command::SELECT_APPLY_SOURCE_CHANGE
+            | rust_analyzer::command::APPLY_SOURCE_CHANGE => self.handle_rust_analyzer_command(cmd),
 
-                self.display_locations(&locations, "References")?;
-            }
-            "rust-analyzer.selectAndApplySourceChange" => {
-                if let Some(ref edits) = cmd.arguments {
-                    for edit in edits {
-                        let workspace_edits: Vec<WorkspaceEditWithCursor> =
-                            serde_json::from_value(edit.clone())?;
-                        for edit in workspace_edits {
-                            self.apply_WorkspaceEdit(&edit.workspaceEdit)?;
-                            if let Some(cursorPosition) = edit.cursorPosition {
-                                self.vim()?.cursor(
-                                    cursorPosition.position.line + 1,
-                                    cursorPosition.position.character + 1,
-                                )?;
-                            }
-                        }
-                    }
-                }
-            }
-            "rust-analyzer.applySourceChange" => {
-                if let Some(ref edits) = cmd.arguments {
-                    for edit in edits {
-                        let edit: WorkspaceEditWithCursor = serde_json::from_value(edit.clone())?;
-                        self.apply_WorkspaceEdit(&edit.workspaceEdit)?;
-                        if let Some(cursorPosition) = edit.cursorPosition {
-                            self.vim()?.cursor(
-                                cursorPosition.position.line + 1,
-                                cursorPosition.position.character + 1,
-                            )?;
-                        }
-                    }
-                }
-            }
-            "rust-analyzer.runSingle" | "rust-analyzer.run" => {
-                let has_term: i32 = self.vim()?.eval("exists(':terminal')")?;
-                if has_term == 0 {
-                    bail!("Terminal support is required for this action");
-                }
-
-                if let Some(ref args) = cmd.arguments {
-                    if let Some(args) = args.first().cloned() {
-                        let bin: String =
-                            try_get("bin", &args)?.ok_or_else(|| err_msg("no bin found"))?;
-                        let arguments: Vec<String> = try_get("args", &args)?.unwrap_or_default();
-                        let cmd = format!("term {} {}", bin, arguments.join(" "));
-                        let cmd = cmd.replace('"', "");
-                        self.vim()?.command(cmd)?;
-                    }
-                }
-            }
-            // TODO: implement all other rust-analyzer actions
-            _ => return Ok(false),
+            _ => Ok(false),
         }
-
-        Ok(true)
     }
 
-    fn cleanup(&self, languageId: &str) -> Fallible<()> {
+    fn cleanup(&self, language_id: &str) -> Result<()> {
         info!("Begin cleanup");
 
         let root = self.get(|state| {
             state
                 .roots
-                .get(languageId)
+                .get(language_id)
                 .cloned()
-                .ok_or_else(|| format_err!("No project root found! languageId: {}", languageId))
+                .ok_or_else(|| anyhow!("No project root found! languageId: {}", language_id))
         })??;
 
         let mut filenames = vec![];
@@ -1084,26 +1007,26 @@ impl LanguageClient {
                 if bufnr > 0 {
                     self.vim()?.rpcclient.notify(
                         "setbufvar",
-                        json!([f, VIM__StatusLineDiagnosticsCounts, {}]),
+                        json!([f, VIM_STATUS_LINE_DIAGNOSTICS_COUNTS, {}]),
                     )?;
                 }
             }
             self.process_diagnostics(&f, &[])?;
         }
-        self.languageClient_handleCursorMoved(&Value::Null)?;
+        self.handle_cursor_moved(&Value::Null)?;
 
         self.update(|state| {
-            state.clients.remove(&Some(languageId.into()));
+            state.clients.remove(&Some(language_id.into()));
             state.last_cursor_line = 0;
             state.text_documents.retain(|f, _| !f.starts_with(&root));
-            state.roots.remove(languageId);
+            state.roots.remove(language_id);
             Ok(())
         })?;
         self.update_quickfixlist()?;
 
         self.vim()?.command(vec![
-            format!("let {}=0", VIM__ServerStatus),
-            format!("let {}=''", VIM__ServerStatusMessage),
+            format!("let {}=0", VIM_SERVER_STATUS),
+            format!("let {}=''", VIM_SERVER_STATUS_MESSAGE),
         ])?;
         self.vim()?
             .rpcclient
@@ -1113,7 +1036,7 @@ impl LanguageClient {
         Ok(())
     }
 
-    fn preview<D>(&self, to_display: &D) -> Fallible<()>
+    fn preview<D>(&self, to_display: &D) -> Result<()>
     where
         D: ToDisplay + ?Sized,
     {
@@ -1128,10 +1051,10 @@ impl LanguageClient {
         Ok(())
     }
 
-    fn edit(&self, goto_cmd: &Option<String>, path: impl AsRef<Path>) -> Fallible<()> {
+    fn edit(&self, goto_cmd: &Option<String>, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref().to_string_lossy();
         if path.starts_with("jdt://") {
-            self.java_classFileContents(&json!({ "gotoCmd": goto_cmd, "uri": path }))?;
+            self.java_class_file_contents(&json!({ "gotoCmd": goto_cmd, "uri": path }))?;
             Ok(())
         } else {
             self.vim()?.edit(&goto_cmd, path.into_owned())
@@ -1140,14 +1063,14 @@ impl LanguageClient {
 
     /////// LSP ///////
 
-    fn initialize(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", lsp::request::Initialize::METHOD);
+    fn initialize(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", lsp_types::request::Initialize::METHOD);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let has_snippet_support: i8 = try_get("hasSnippetSupport", params)?
             .map_or_else(|| self.vim()?.eval("s:hasSnippetSupport()"), Ok)?;
         let has_snippet_support = has_snippet_support > 0;
-        let root = self.get(|state| state.roots.get(&languageId).cloned().unwrap_or_default())?;
+        let root = self.get(|state| state.roots.get(&language_id).cloned().unwrap_or_default())?;
 
         let initialization_options = self
             .get_workspace_settings(&root)
@@ -1157,7 +1080,7 @@ impl LanguageClient {
                 json!(Value::Null)
             });
         let initialization_options =
-            get_default_initializationOptions(&languageId).combine(&initialization_options);
+            get_default_initialization_options(&language_id).combine(&initialization_options);
         let initialization_options = if initialization_options.is_null() {
             None
         } else {
@@ -1167,13 +1090,13 @@ impl LanguageClient {
         let trace = self.get(|state| state.trace)?;
         let preferred_markup_kind = self.get(|state| state.preferred_markup_kind.clone())?;
 
-        let result: Value = self.get_client(&Some(languageId.clone()))?.call(
-            lsp::request::Initialize::METHOD,
+        let result: Value = self.get_client(&Some(language_id.clone()))?.call(
+            lsp_types::request::Initialize::METHOD,
             #[allow(deprecated)]
             InitializeParams {
                 client_info: Some(ClientInfo {
                     name: "LanguageClient-neovim".into(),
-                    version: Some((*self.version).clone()),
+                    version: Some(self.version.clone()),
                 }),
                 process_id: Some(u64::from(std::process::id())),
                 /* deprecated in lsp types, but can't initialize without it */
@@ -1182,13 +1105,40 @@ impl LanguageClient {
                 initialization_options,
                 capabilities: ClientCapabilities {
                     text_document: Some(TextDocumentClientCapabilities {
+                        color_provider: Some(GenericCapability {
+                            dynamic_registration: Some(false),
+                        }),
                         completion: Some(CompletionCapability {
                             completion_item: Some(CompletionItemCapability {
                                 snippet_support: Some(has_snippet_support),
                                 documentation_format: preferred_markup_kind.clone(),
+                                // note that if this value was to be changed to true, then
+                                // additional changes around edits should be made, as it currently
+                                // just panics if it encounters a completion item of type
+                                // InsertAndReplace.
+                                insert_replace_support: Some(false),
                                 ..CompletionItemCapability::default()
                             }),
                             ..CompletionCapability::default()
+                        }),
+                        code_action: Some(CodeActionCapability {
+                            code_action_literal_support: Some(CodeActionLiteralSupport {
+                                code_action_kind: CodeActionKindLiteralSupport {
+                                    value_set: [
+                                        code_action_kind::QUICKFIX,
+                                        code_action_kind::REFACTOR,
+                                        code_action_kind::REFACTOR_EXTRACT,
+                                        code_action_kind::REFACTOR_INLINE,
+                                        code_action_kind::REFACTOR_REWRITE,
+                                        code_action_kind::SOURCE,
+                                        code_action_kind::SOURCE_ORGANIZE_IMPORTS,
+                                    ]
+                                    .iter()
+                                    .map(|x| x.to_string())
+                                    .collect(),
+                                },
+                            }),
+                            ..CodeActionCapability::default()
                         }),
                         signature_help: Some(SignatureHelpCapability {
                             signature_information: Some(SignatureInformationSettings {
@@ -1250,23 +1200,23 @@ impl LanguageClient {
         self.update(|state| {
             state
                 .capabilities
-                .insert(languageId.clone(), result.clone());
+                .insert(language_id.clone(), result.clone());
             Ok(())
         })?;
 
-        info!("End {}", lsp::request::Initialize::METHOD);
+        info!("End {}", lsp_types::request::Initialize::METHOD);
 
-        if let Err(e) = self.registerCMSource(&languageId, &result) {
+        if let Err(e) = self.register_cm_source(&language_id, &result) {
             let message = format!("LanguageClient: failed to register as NCM source: {}", e);
             error!("{}\n{:?}", message, e);
             self.vim()?.echoerr(&message)?;
         }
-        if let Err(e) = self.registerNCM2Source(&languageId, &result) {
+        if let Err(e) = self.register_ncm2_source(&language_id, &result) {
             let message = format!("LanguageClient: failed to register as NCM source: {}", e);
             error!("{}\n{:?}", message, e);
             self.vim()?.echoerr(&message)?;
         }
-        if let Err(e) = self.parseSemanticScopes(&languageId, &result) {
+        if let Err(e) = self.parse_semantic_scopes(&language_id, &result) {
             let message = format!("LanguageClient: failed to parse semantic scopes: {}", e);
             error!("{}\n{:?}", message, e);
             self.vim()?.echoerr(&message)?;
@@ -1275,26 +1225,28 @@ impl LanguageClient {
         Ok(result)
     }
 
-    fn initialized(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", lsp::notification::Initialized::METHOD);
+    fn initialized(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", lsp_types::notification::Initialized::METHOD);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
-        self.updateSemanticHighlightTables(&languageId)?;
-        self.get_client(&Some(languageId))?
-            .notify(lsp::notification::Initialized::METHOD, InitializedParams {})?;
-        info!("End {}", lsp::notification::Initialized::METHOD);
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
+        self.update_semantic_highlight_tables(&language_id)?;
+        self.get_client(&Some(language_id))?.notify(
+            lsp_types::notification::Initialized::METHOD,
+            InitializedParams {},
+        )?;
+        info!("End {}", lsp_types::notification::Initialized::METHOD);
         Ok(())
     }
 
-    pub fn textDocument_hover(&self, params: &Value) -> Fallible<Value> {
-        self.textDocument_didChange(params)?;
-        info!("Begin {}", lsp::request::HoverRequest::METHOD);
+    pub fn text_document_hover(&self, params: &Value) -> Result<Value> {
+        self.text_document_did_change(params)?;
+        info!("Begin {}", lsp_types::request::HoverRequest::METHOD);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let position = self.vim()?.get_position(params)?;
 
-        let result = self.get_client(&Some(languageId))?.call(
-            lsp::request::HoverRequest::METHOD,
+        let result = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::HoverRequest::METHOD,
             TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
                     uri: filename.to_url()?,
@@ -1307,10 +1259,10 @@ impl LanguageClient {
             return Ok(result);
         }
 
-        let hover: Option<Hover> = serde_json::from_value(result.clone())?;
+        let hover = Option::<Hover>::deserialize(&result)?;
         if let Some(hover) = hover {
-            let hoverPreview = self.get(|state| state.hoverPreview)?;
-            let use_preview = match hoverPreview {
+            let hover_preview = self.get(|state| state.hover_preview)?;
+            let use_preview = match hover_preview {
                 HoverPreviewOption::Always => true,
                 HoverPreviewOption::Never => false,
                 HoverPreviewOption::Auto => hover.lines_len() > 1,
@@ -1322,18 +1274,18 @@ impl LanguageClient {
             }
         }
 
-        info!("End {}", lsp::request::HoverRequest::METHOD);
+        info!("End {}", lsp_types::request::HoverRequest::METHOD);
         Ok(result)
     }
 
     /// Generic find locations, e.g, definitions, references.
-    pub fn find_locations(&self, params: &Value) -> Fallible<Value> {
-        self.textDocument_didChange(params)?;
+    pub fn find_locations(&self, params: &Value) -> Result<Value> {
+        self.text_document_did_change(params)?;
         let method: String =
-            try_get("method", params)?.ok_or_else(|| err_msg("method not found in request!"))?;
+            try_get("method", params)?.ok_or_else(|| anyhow!("method not found in request!"))?;
         info!("Begin {}", method);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let position = self.vim()?.get_position(params)?;
         let current_word = self.vim()?.get_current_word(params)?;
         let goto_cmd = self.vim()?.get_goto_cmd(params)?;
@@ -1346,13 +1298,15 @@ impl LanguageClient {
         })?
         .combine(params);
 
-        let result = self.get_client(&Some(languageId))?.call(&method, &params)?;
+        let result = self
+            .get_client(&Some(language_id))?
+            .call(&method, &params)?;
 
         if !self.vim()?.get_handle(&params)? {
             return Ok(result);
         }
 
-        let response: Option<GotoDefinitionResponse> = result.clone().to_lsp()?;
+        let response = Option::<GotoDefinitionResponse>::deserialize(&result)?;
 
         let locations = match response {
             None => vec![],
@@ -1367,7 +1321,7 @@ impl LanguageClient {
         match locations.len() {
             0 => self.vim()?.echowarn("Not found!")?,
             1 => {
-                let loc = locations.get(0).ok_or_else(|| err_msg("Not found!"))?;
+                let loc = locations.get(0).ok_or_else(|| anyhow!("Not found!"))?;
                 let path = loc.uri.filepath()?.to_string_lossy().into_owned();
                 self.edit(&goto_cmd, path)?;
                 self.vim()?
@@ -1382,7 +1336,7 @@ impl LanguageClient {
             }
             _ => {
                 let title = format!("[LC]: search for {}", current_word);
-                self.display_locations(&locations, &title)?
+                self.present_list(&title, &locations)?
             }
         }
 
@@ -1390,11 +1344,11 @@ impl LanguageClient {
         Ok(result)
     }
 
-    pub fn textDocument_rename(&self, params: &Value) -> Fallible<Value> {
-        self.textDocument_didChange(params)?;
-        info!("Begin {}", lsp::request::Rename::METHOD);
+    pub fn text_document_rename(&self, params: &Value) -> Result<Value> {
+        self.text_document_did_change(params)?;
+        info!("Begin {}", lsp_types::request::Rename::METHOD);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let position = self.vim()?.get_position(params)?;
         let current_word = self.vim()?.get_current_word(params)?;
         let new_name: Option<String> = try_get("newName", params)?;
@@ -1410,8 +1364,8 @@ impl LanguageClient {
             return Ok(Value::Null);
         }
 
-        let result = self.get_client(&Some(languageId))?.call(
-            lsp::request::Rename::METHOD,
+        let result = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::Rename::METHOD,
             RenameParams {
                 text_document_position: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier {
@@ -1432,25 +1386,30 @@ impl LanguageClient {
         }
 
         let edit: WorkspaceEdit = serde_json::from_value(result.clone())?;
-        self.apply_WorkspaceEdit(&edit)?;
+        self.apply_workspace_edit(&edit)?;
 
-        info!("End {}", lsp::request::Rename::METHOD);
+        info!("End {}", lsp_types::request::Rename::METHOD);
         Ok(result)
     }
 
-    pub fn textDocument_documentSymbol(&self, params: &Value) -> Fallible<Value> {
-        self.textDocument_didChange(params)?;
-        info!("Begin {}", lsp::request::DocumentSymbolRequest::METHOD);
+    pub fn text_document_document_symbol(&self, params: &Value) -> Result<Value> {
+        self.text_document_did_change(params)?;
+        info!(
+            "Begin {}",
+            lsp_types::request::DocumentSymbolRequest::METHOD
+        );
 
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
 
-        let result = self.get_client(&Some(languageId))?.call(
-            lsp::request::DocumentSymbolRequest::METHOD,
+        let result = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::DocumentSymbolRequest::METHOD,
             DocumentSymbolParams {
                 text_document: TextDocumentIdentifier {
                     uri: filename.to_url()?,
                 },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
             },
         )?;
 
@@ -1458,126 +1417,55 @@ impl LanguageClient {
             return Ok(result);
         }
 
-        let syms: <lsp::request::DocumentSymbolRequest as lsp::request::Request>::Result =
-            serde_json::from_value(result.clone())?;
-
+        let syms = <lsp_types::request::DocumentSymbolRequest as lsp_types::request::Request>::Result::deserialize(&result)?;
         let title = format!("[LC]: symbols for {}", filename);
 
-        let selectionUI = self.get(|state| state.selectionUI)?;
-        let selectionUI_autoOpen = self.get(|state| state.selectionUI_autoOpen)?;
-        match selectionUI {
-            SelectionUI::FZF => {
-                let symbols = match syms {
-                    Some(lsp::DocumentSymbolResponse::Flat(flat)) => flat
-                        .iter()
-                        .map(|sym| {
-                            let start = sym.location.range.start;
-                            format!(
-                                "{}:{}:\t{}\t\t{:?}",
-                                start.line + 1,
-                                start.character + 1,
-                                sym.name,
-                                sym.kind
-                            )
-                        })
-                        .collect(),
-                    Some(lsp::DocumentSymbolResponse::Nested(nested)) => {
-                        let mut symbols = Vec::new();
+        match syms {
+            Some(lsp_types::DocumentSymbolResponse::Flat(flat)) => {
+                self.present_list(&title, &flat)?;
+            }
+            Some(lsp_types::DocumentSymbolResponse::Nested(nested)) => {
+                let mut symbols = Vec::new();
 
-                        fn walk_document_symbol(
-                            buffer: &mut Vec<String>,
-                            parent: Option<&str>,
-                            ds: &lsp::DocumentSymbol,
-                        ) {
-                            let start = ds.selection_range.start;
+                fn walk_document_symbol(
+                    buffer: &mut Vec<lsp_types::DocumentSymbol>,
+                    parent: Option<&lsp_types::DocumentSymbol>,
+                    ds: &lsp_types::DocumentSymbol,
+                ) {
+                    let name = if let Some(parent) = parent {
+                        format!("{}::{}", parent.name, ds.name)
+                    } else {
+                        ds.name.clone()
+                    };
 
-                            let name = if let Some(parent) = parent {
-                                format!("{}::{}", parent, ds.name)
-                            } else {
-                                ds.name.clone()
-                            };
+                    buffer.push(lsp_types::DocumentSymbol { name, ..ds.clone() });
 
-                            let n = format!(
-                                "{}:{}:\t{}\t\t{:?}",
-                                start.line + 1,
-                                start.character + 1,
-                                name,
-                                ds.kind
-                            );
-
-                            buffer.push(n);
-
-                            if let Some(children) = &ds.children {
-                                for child in children {
-                                    walk_document_symbol(buffer, Some(&ds.name), child);
-                                }
-                            }
+                    if let Some(children) = &ds.children {
+                        for child in children {
+                            walk_document_symbol(buffer, Some(&ds), child);
                         }
-
-                        for ds in &nested {
-                            walk_document_symbol(&mut symbols, None, ds);
-                        }
-
-                        symbols
                     }
-                    _ => Vec::new(),
-                };
-
-                self.vim()?.rpcclient.notify(
-                    "s:FZF",
-                    json!([symbols, format!("s:{}", NOTIFICATION__FZFSinkLocation)]),
-                )?;
-            }
-            SelectionUI::Quickfix => {
-                let list = match syms {
-                    Some(lsp::DocumentSymbolResponse::Flat(flat)) => {
-                        flat.iter().map(QuickfixEntry::from_lsp).collect()
-                    }
-                    Some(lsp::DocumentSymbolResponse::Nested(nested)) => {
-                        <Vec<QuickfixEntry>>::from_lsp(&nested)
-                    }
-                    _ => Ok(Vec::new()),
-                };
-
-                let list = list?;
-                self.vim()?.setqflist(&list, " ", &title)?;
-                if selectionUI_autoOpen {
-                    self.vim()?.command("botright copen")?;
                 }
-                self.vim()?
-                    .echo("Document symbols populated to quickfix list.")?;
-            }
-            SelectionUI::LocationList => {
-                let list = match syms {
-                    Some(lsp::DocumentSymbolResponse::Flat(flat)) => {
-                        flat.iter().map(QuickfixEntry::from_lsp).collect()
-                    }
-                    Some(lsp::DocumentSymbolResponse::Nested(nested)) => {
-                        <Vec<QuickfixEntry>>::from_lsp(&nested)
-                    }
-                    _ => Ok(Vec::new()),
-                };
 
-                let list = list?;
-                self.vim()?.setloclist(&list, " ", &title)?;
-                if selectionUI_autoOpen {
-                    self.vim()?.command("lopen")?;
+                for ds in &nested {
+                    walk_document_symbol(&mut symbols, None, ds);
                 }
-                self.vim()?
-                    .echo("Document symbols populated to location list.")?;
-            }
-        }
 
-        info!("End {}", lsp::request::DocumentSymbolRequest::METHOD);
+                self.present_list(&title, &symbols)?;
+            }
+            _ => (),
+        };
+
+        info!("End {}", lsp_types::request::DocumentSymbolRequest::METHOD);
         Ok(result)
     }
 
-    pub fn textDocument_codeAction(&self, params: &Value) -> Fallible<Value> {
-        self.textDocument_didChange(params)?;
-        info!("Begin {}", lsp::request::CodeActionRequest::METHOD);
+    pub fn text_document_code_action(&self, params: &Value) -> Result<Value> {
+        self.text_document_did_change(params)?;
+        info!("Begin {}", lsp_types::request::CodeActionRequest::METHOD);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
-        let position = self.vim()?.get_position(params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
+        let range: Range = serde_json::from_value(params["range"].clone())?;
 
         // Unify filename.
         let filename = filename.canonicalize();
@@ -1588,21 +1476,18 @@ impl LanguageClient {
                 .get(&filename)
                 .unwrap_or(&vec![])
                 .iter()
-                .filter(|dn| position >= dn.range.start && position < dn.range.end)
+                .filter(|dn| range.start >= dn.range.start && range.start < dn.range.end)
                 .cloned()
                 .collect()
         })?;
 
-        let result: Value = self.get_client(&Some(languageId))?.call(
-            lsp::request::CodeActionRequest::METHOD,
+        let result: Value = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::CodeActionRequest::METHOD,
             CodeActionParams {
                 text_document: TextDocumentIdentifier {
                     uri: filename.to_url()?,
                 },
-                range: Range {
-                    start: position,
-                    end: position,
-                },
+                range,
                 context: CodeActionContext {
                     diagnostics,
                     only: None,
@@ -1612,8 +1497,8 @@ impl LanguageClient {
             },
         )?;
 
-        let response: Option<CodeActionResponse> = serde_json::from_value(result.clone())?;
-        let response = response.unwrap_or_else(|| vec![]);
+        let response = <Option<CodeActionResponse>>::deserialize(&result)?;
+        let response = response.unwrap_or_default();
 
         // Convert any Commands into CodeActions, so that the remainder of the handling can be
         // shared.
@@ -1632,19 +1517,8 @@ impl LanguageClient {
             })
             .collect();
 
-        let source: Vec<_> = actions
-            .iter()
-            .map(|action| {
-                format!(
-                    "{}: {}",
-                    action.kind.as_ref().map_or("action", String::as_ref),
-                    action.title
-                )
-            })
-            .collect();
-
         self.update(|state| {
-            state.stashed_codeAction_actions = actions;
+            state.stashed_code_action_actions = actions.clone();
             Ok(())
         })?;
 
@@ -1652,23 +1526,52 @@ impl LanguageClient {
             return Ok(result);
         }
 
-        self.vim()?
-            .rpcclient
-            .notify("s:FZF", json!([source, NOTIFICATION__FZFSinkCommand]))?;
+        self.present_actions("Code Actions", &actions, |idx| -> Result<()> {
+            self.handle_code_action_selection(&actions, idx)
+        })?;
 
-        info!("End {}", lsp::request::CodeActionRequest::METHOD);
+        info!("End {}", lsp_types::request::CodeActionRequest::METHOD);
         Ok(result)
     }
 
-    pub fn textDocument_completion(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", lsp::request::Completion::METHOD);
+    fn handle_code_action_selection(&self, actions: &[CodeAction], idx: usize) -> Result<()> {
+        match actions.get(idx) {
+            Some(action) => {
+                // Apply edit before command.
+                if let Some(edit) = &action.edit {
+                    self.apply_workspace_edit(edit)?;
+                }
+
+                if let Some(command) = &action.command {
+                    if !self.try_handle_command_by_client(&command)? {
+                        let params = json!({
+                        "command": command.command,
+                        "arguments": command.arguments,
+                        });
+                        self.workspace_execute_command(&params)?;
+                    }
+                }
+
+                self.update(|state| {
+                    state.stashed_code_action_actions = vec![];
+                    Ok(())
+                })?;
+            }
+            None => return Err(anyhow!("Code action not stashed, please try again")),
+        };
+
+        Ok(())
+    }
+
+    pub fn text_document_completion(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", lsp_types::request::Completion::METHOD);
 
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let position = self.vim()?.get_position(params)?;
 
-        let result = self.get_client(&Some(languageId))?.call(
-            lsp::request::Completion::METHOD,
+        let result = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::Completion::METHOD,
             TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
                     uri: filename.to_url()?,
@@ -1681,19 +1584,19 @@ impl LanguageClient {
             return Ok(result);
         }
 
-        info!("End {}", lsp::request::Completion::METHOD);
+        info!("End {}", lsp_types::request::Completion::METHOD);
         Ok(result)
     }
 
-    pub fn textDocument_signatureHelp(&self, params: &Value) -> Fallible<Value> {
-        self.textDocument_didChange(params)?;
-        info!("Begin {}", lsp::request::SignatureHelpRequest::METHOD);
+    pub fn text_document_signature_help(&self, params: &Value) -> Result<Value> {
+        self.text_document_did_change(params)?;
+        info!("Begin {}", lsp_types::request::SignatureHelpRequest::METHOD);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let position = self.vim()?.get_position(params)?;
 
-        let result = self.get_client(&Some(languageId))?.call(
-            lsp::request::SignatureHelpRequest::METHOD,
+        let result = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::SignatureHelpRequest::METHOD,
             TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
                     uri: filename.to_url()?,
@@ -1721,7 +1624,7 @@ impl LanguageClient {
         let active_signature = help
             .signatures
             .get(active_signature_index)
-            .ok_or_else(|| err_msg("Failed to get active signature"))?;
+            .ok_or_else(|| anyhow!("Failed to get active signature"))?;
 
         // active_signature may be negative value.
         // So if it is negative value, we convert it into zero.
@@ -1735,7 +1638,7 @@ impl LanguageClient {
         }
 
         if let Some((begin, label, end)) = active_parameter.and_then(|active_parameter| {
-            decode_parameterLabel(&active_parameter.label, &active_signature.label).ok()
+            decode_parameter_label(&active_parameter.label, &active_signature.label).ok()
         }) {
             let cmd = format!(
                 "echo | echon '{}' | echohl WarningMsg | echon '{}' | echohl None | echon '{}'",
@@ -1746,17 +1649,17 @@ impl LanguageClient {
             self.vim()?.echo(&active_signature.label)?;
         }
 
-        info!("End {}", lsp::request::SignatureHelpRequest::METHOD);
+        info!("End {}", lsp_types::request::SignatureHelpRequest::METHOD);
         Ok(Value::Null)
     }
 
-    pub fn textDocument_references(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", lsp::request::References::METHOD);
+    pub fn text_document_references(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", lsp_types::request::References::METHOD);
 
         let include_declaration: bool = try_get("includeDeclaration", params)?.unwrap_or(true);
         // TODO: cleanup.
         let params = json!({
-            "method": lsp::request::References::METHOD,
+            "method": lsp_types::request::References::METHOD,
             "context": ReferenceContext {
                 include_declaration,
             }
@@ -1764,20 +1667,20 @@ impl LanguageClient {
         .combine(params);
         let result = self.find_locations(&params)?;
 
-        info!("End {}", lsp::request::References::METHOD);
+        info!("End {}", lsp_types::request::References::METHOD);
         Ok(result)
     }
 
-    pub fn textDocument_formatting(&self, params: &Value) -> Fallible<Value> {
-        self.textDocument_didChange(params)?;
-        info!("Begin {}", lsp::request::Formatting::METHOD);
+    pub fn text_document_formatting(&self, params: &Value) -> Result<Value> {
+        self.text_document_did_change(params)?;
+        info!("Begin {}", lsp_types::request::Formatting::METHOD);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
 
         let tab_size = self.vim()?.get_tab_size()?;
         let insert_spaces = self.vim()?.get_insert_spaces(&filename)?;
-        let result = self.get_client(&Some(languageId))?.call(
-            lsp::request::Formatting::METHOD,
+        let result = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::Formatting::METHOD,
             DocumentFormattingParams {
                 text_document: TextDocumentIdentifier {
                     uri: filename.to_url()?,
@@ -1798,20 +1701,20 @@ impl LanguageClient {
 
         let text_edits: Option<Vec<TextEdit>> = serde_json::from_value(result.clone())?;
         let text_edits = text_edits.unwrap_or_default();
-        let edit = lsp::WorkspaceEdit {
+        let edit = lsp_types::WorkspaceEdit {
             changes: Some(hashmap! {filename.to_url()? => text_edits}),
             document_changes: None,
         };
-        self.apply_WorkspaceEdit(&edit)?;
-        info!("End {}", lsp::request::Formatting::METHOD);
+        self.apply_workspace_edit(&edit)?;
+        info!("End {}", lsp_types::request::Formatting::METHOD);
         Ok(result)
     }
 
-    pub fn textDocument_rangeFormatting(&self, params: &Value) -> Fallible<Value> {
-        self.textDocument_didChange(params)?;
-        info!("Begin {}", lsp::request::RangeFormatting::METHOD);
+    pub fn text_document_range_formatting(&self, params: &Value) -> Result<Value> {
+        self.text_document_did_change(params)?;
+        info!("Begin {}", lsp_types::request::RangeFormatting::METHOD);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let start_line = try_get("range_start_line", params)?
             .map_or_else(|| self.vim()?.eval("LSP#range_start_line()"), Ok)?;
         let end_line = try_get("range_end_line", params)?
@@ -1819,8 +1722,8 @@ impl LanguageClient {
 
         let tab_size = self.vim()?.get_tab_size()?;
         let insert_spaces = self.vim()?.get_insert_spaces(&filename)?;
-        let result = self.get_client(&Some(languageId))?.call(
-            lsp::request::RangeFormatting::METHOD,
+        let result = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::RangeFormatting::METHOD,
             DocumentRangeFormattingParams {
                 text_document: TextDocumentIdentifier {
                     uri: filename.to_url()?,
@@ -1851,26 +1754,30 @@ impl LanguageClient {
 
         let text_edits: Option<Vec<TextEdit>> = serde_json::from_value(result.clone())?;
         let text_edits = text_edits.unwrap_or_default();
-        let edit = lsp::WorkspaceEdit {
+        let edit = lsp_types::WorkspaceEdit {
             changes: Some(hashmap! {filename.to_url()? => text_edits}),
             document_changes: None,
         };
-        self.apply_WorkspaceEdit(&edit)?;
-        info!("End {}", lsp::request::RangeFormatting::METHOD);
+        self.apply_workspace_edit(&edit)?;
+        info!("End {}", lsp_types::request::RangeFormatting::METHOD);
         Ok(result)
     }
 
-    pub fn completionItem_resolve(&self, params: &Value) -> Fallible<Value> {
-        self.textDocument_didChange(params)?;
-        info!("Begin {}", lsp::request::ResolveCompletionItem::METHOD);
+    pub fn completion_item_resolve(&self, params: &Value) -> Result<Value> {
+        self.text_document_did_change(params)?;
+        info!(
+            "Begin {}",
+            lsp_types::request::ResolveCompletionItem::METHOD
+        );
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let completion_item: CompletionItem = try_get("completionItem", params)?
-            .ok_or_else(|| err_msg("completionItem not found in request!"))?;
+            .ok_or_else(|| anyhow!("completionItem not found in request!"))?;
 
-        let result = self
-            .get_client(&Some(languageId))?
-            .call(lsp::request::ResolveCompletionItem::METHOD, completion_item)?;
+        let result = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::ResolveCompletionItem::METHOD,
+            completion_item,
+        )?;
 
         if !self.vim()?.get_handle(params)? {
             return Ok(result);
@@ -1881,19 +1788,113 @@ impl LanguageClient {
         warn!("{}", msg);
         self.vim()?.echowarn(&msg)?;
 
-        info!("End {}", lsp::request::ResolveCompletionItem::METHOD);
+        info!("End {}", lsp_types::request::ResolveCompletionItem::METHOD);
         Ok(Value::Null)
     }
 
-    pub fn workspace_symbol(&self, params: &Value) -> Fallible<Value> {
-        self.textDocument_didChange(params)?;
-        info!("Begin {}", lsp::request::WorkspaceSymbol::METHOD);
+    // shows a list of actions for the user to choose one.
+    fn present_actions<T, F>(&self, title: &str, actions: &[T], callback: F) -> Result<()>
+    where
+        T: ListItem,
+        F: Fn(usize) -> Result<()>,
+    {
+        if actions.is_empty() {
+            return Err(anyhow!("No code actions found at point"));
+        }
+
+        let cwd: String = self.vim()?.eval("getcwd()")?;
+        let actions: Result<Vec<String>> = actions
+            .iter()
+            .map(|it| ListItem::string_item(it, self, &cwd))
+            .collect();
+
+        match self.get(|state| state.selection_ui)? {
+            SelectionUI::Funcref => {
+                self.vim()?.rpcclient.notify(
+                    "s:selectionUI_funcref",
+                    json!([actions?, NOTIFICATION_FZF_SINK_COMMAND]),
+                )?;
+            }
+            SelectionUI::Quickfix | SelectionUI::LocationList => {
+                let mut actions: Vec<String> = actions?
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(idx, it)| format!("{}) {}", idx + 1, it))
+                    .collect();
+                let mut options = vec![title.to_string()];
+                options.append(&mut actions);
+
+                let index: Option<usize> = self.vim()?.rpcclient.call("s:inputlist", options)?;
+                if let Some(index) = index {
+                    return callback(index - 1);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // shows a list of items, used for things like diagnostics or things that do not need a user
+    // selection.
+    pub fn present_list<T>(&self, title: &str, items: &[T]) -> Result<()>
+    where
+        T: ListItem,
+    {
+        let selection_ui = self.get(|state| state.selection_ui)?;
+        let selection_ui_auto_open = self.get(|state| state.selection_ui_auto_open)?;
+
+        match selection_ui {
+            SelectionUI::Funcref => {
+                let cwd: String = self.vim()?.eval("getcwd()")?;
+                let source: Result<Vec<_>> = items
+                    .iter()
+                    .map(|it| ListItem::string_item(it, self, &cwd))
+                    .collect();
+                let source = source?;
+
+                self.vim()?.rpcclient.notify(
+                    "s:selectionUI_funcref",
+                    json!([source, format!("s:{}", NOTIFICATION_FZF_SINK_LOCATION)]),
+                )?;
+            }
+            SelectionUI::Quickfix => {
+                let list: Result<Vec<_>> = items
+                    .iter()
+                    .map(|it| ListItem::quickfix_item(it, self))
+                    .collect();
+                let list = list?;
+                self.vim()?.setqflist(&list, " ", title)?;
+                if selection_ui_auto_open {
+                    self.vim()?.command("botright copen")?;
+                }
+                self.vim()?.echo("Populated quickfix list.")?;
+            }
+            SelectionUI::LocationList => {
+                let list: Result<Vec<_>> = items
+                    .iter()
+                    .map(|it| ListItem::quickfix_item(it, self))
+                    .collect();
+                let list = list?;
+                self.vim()?.setloclist(&list, " ", title)?;
+                if selection_ui_auto_open {
+                    self.vim()?.command("lopen")?;
+                }
+                self.vim()?.echo("Populated location list.")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn workspace_symbol(&self, params: &Value) -> Result<Value> {
+        self.text_document_did_change(params)?;
+        info!("Begin {}", lsp_types::request::WorkspaceSymbol::METHOD);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
 
         let query = try_get("query", params)?.unwrap_or_default();
-        let result = self.get_client(&Some(languageId))?.call(
-            lsp::request::WorkspaceSymbol::METHOD,
+        let result = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::WorkspaceSymbol::METHOD,
             WorkspaceSymbolParams {
                 query,
                 partial_result_params: PartialResultParams::default(),
@@ -1905,114 +1906,69 @@ impl LanguageClient {
             return Ok(result);
         }
 
-        let symbols: Vec<SymbolInformation> = serde_json::from_value(result.clone())?;
+        let symbols = <Vec<SymbolInformation>>::deserialize(&result)?;
         let title = "[LC]: workspace symbols";
 
-        let selectionUI = self.get(|state| state.selectionUI)?;
-        let selectionUI_autoOpen = self.get(|state| state.selectionUI_autoOpen)?;
-        match selectionUI {
-            SelectionUI::FZF => {
-                let cwd: String = self.vim()?.eval("getcwd()")?;
-                let source: Fallible<Vec<_>> = symbols
-                    .iter()
-                    .map(|sym| {
-                        let filename = sym.location.uri.filepath()?;
-                        let relpath = diff_paths(&filename, Path::new(&cwd)).unwrap_or(filename);
-                        let start = sym.location.range.start;
-                        Ok(format!(
-                            "{}:{}:{}:\t{}\t\t{:?}",
-                            relpath.to_string_lossy(),
-                            start.line + 1,
-                            start.character + 1,
-                            sym.name,
-                            sym.kind
-                        ))
-                    })
-                    .collect();
-                let source = source?;
+        self.present_list(title, &symbols)?;
 
-                self.vim()?.rpcclient.notify(
-                    "s:FZF",
-                    json!([source, format!("s:{}", NOTIFICATION__FZFSinkLocation)]),
-                )?;
-            }
-            SelectionUI::Quickfix => {
-                let list: Fallible<Vec<_>> = symbols.iter().map(QuickfixEntry::from_lsp).collect();
-                let list = list?;
-                self.vim()?.setqflist(&list, " ", title)?;
-                if selectionUI_autoOpen {
-                    self.vim()?.command("botright copen")?;
-                }
-                self.vim()?
-                    .echo("Workspace symbols populated to quickfix list.")?;
-            }
-            SelectionUI::LocationList => {
-                let list: Fallible<Vec<_>> = symbols.iter().map(QuickfixEntry::from_lsp).collect();
-                let list = list?;
-                self.vim()?.setloclist(&list, " ", title)?;
-                if selectionUI_autoOpen {
-                    self.vim()?.command("lopen")?;
-                }
-                self.vim()?
-                    .echo("Workspace symbols populated to location list.")?;
-            }
-        }
-
-        info!("End {}", lsp::request::WorkspaceSymbol::METHOD);
+        info!("End {}", lsp_types::request::WorkspaceSymbol::METHOD);
         Ok(result)
     }
 
-    pub fn workspace_executeCommand(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", lsp::request::ExecuteCommand::METHOD);
+    pub fn workspace_execute_command(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", lsp_types::request::ExecuteCommand::METHOD);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let command: String =
-            try_get("command", params)?.ok_or_else(|| err_msg("command not found in request!"))?;
+            try_get("command", params)?.ok_or_else(|| anyhow!("command not found in request!"))?;
         let arguments: Vec<Value> = try_get("arguments", params)?.unwrap_or_default();
 
-        let result = self.get_client(&Some(languageId))?.call(
-            lsp::request::ExecuteCommand::METHOD,
+        let result = self.get_client(&Some(language_id))?.call(
+            lsp_types::request::ExecuteCommand::METHOD,
             ExecuteCommandParams {
                 command,
                 arguments,
                 work_done_progress_params: WorkDoneProgressParams::default(),
             },
         )?;
-        info!("End {}", lsp::request::ExecuteCommand::METHOD);
+        info!("End {}", lsp_types::request::ExecuteCommand::METHOD);
         Ok(result)
     }
 
-    pub fn workspace_applyEdit(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", lsp::request::ApplyWorkspaceEdit::METHOD);
+    pub fn workspace_apply_edit(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", lsp_types::request::ApplyWorkspaceEdit::METHOD);
 
-        let params: ApplyWorkspaceEditParams = params.clone().to_lsp()?;
-        self.apply_WorkspaceEdit(&params.edit)?;
+        let params = ApplyWorkspaceEditParams::deserialize(params)?;
+        self.apply_workspace_edit(&params.edit)?;
 
-        info!("End {}", lsp::request::ApplyWorkspaceEdit::METHOD);
+        info!("End {}", lsp_types::request::ApplyWorkspaceEdit::METHOD);
 
         Ok(serde_json::to_value(ApplyWorkspaceEditResponse {
             applied: true,
         })?)
     }
 
-    pub fn workspace_didChangeConfiguration(&self, params: &Value) -> Fallible<()> {
+    pub fn workspace_did_change_configuration(&self, params: &Value) -> Result<()> {
         info!(
             "Begin {}",
-            lsp::notification::DidChangeConfiguration::METHOD
+            lsp_types::notification::DidChangeConfiguration::METHOD
         );
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let settings: Value = try_get("settings", params)?.unwrap_or_default();
 
-        self.get_client(&Some(languageId))?.notify(
-            lsp::notification::DidChangeConfiguration::METHOD,
+        self.get_client(&Some(language_id))?.notify(
+            lsp_types::notification::DidChangeConfiguration::METHOD,
             DidChangeConfigurationParams { settings },
         )?;
-        info!("End {}", lsp::notification::DidChangeConfiguration::METHOD);
+        info!(
+            "End {}",
+            lsp_types::notification::DidChangeConfiguration::METHOD
+        );
         Ok(())
     }
 
-    pub fn languageClient_handleCodeLensAction(&self, params: &Value) -> Fallible<Value> {
+    pub fn handle_code_lens_action(&self, params: &Value) -> Result<Value> {
         let filename = self.vim()?.get_filename(params)?;
         let line = self.vim()?.get_position(params)?.line;
 
@@ -2031,43 +1987,79 @@ impl LanguageClient {
             return Ok(Value::Null);
         }
 
+        let actions: Result<Vec<CodeAction>> = code_lens
+            .iter()
+            .map(|cl| match &cl.command {
+                None => Err(anyhow!("no command, skipping")),
+                Some(cmd) => Ok(CodeAction {
+                    kind: Some(cmd.command.clone()),
+                    title: cmd.title.clone(),
+                    command: cl.clone().command,
+                    diagnostics: None,
+                    edit: None,
+                    is_preferred: None,
+                }),
+            })
+            .filter(Result::is_ok)
+            .collect();
+        let actions = actions?;
+
         self.update(|state| {
-            let actions: Fallible<Vec<_>> = code_lens
-                .iter()
-                .map(|cl| match &cl.command {
-                    None => bail!("no command, skipping"),
-                    Some(cmd) => Ok(CodeAction {
-                        kind: Some(cmd.title.clone()),
-                        title: cmd.command.clone(),
-                        command: cl.clone().command,
-                        diagnostics: None,
-                        edit: None,
-                        is_preferred: None,
-                    }),
-                })
-                .filter(|c| c.is_ok())
-                .collect();
-            state.stashed_codeAction_actions = actions?;
+            state.stashed_code_action_actions = actions.clone();
             Ok(())
         })?;
 
-        let source: Fallible<Vec<_>> = code_lens
+        let source: Result<Vec<Command>> = actions
             .iter()
-            .map(|cl| match &cl.command {
-                None => bail!("no command, skipping"),
-                Some(cmd) => Ok(format!("{}: {}", cmd.title, cmd.command)),
+            .map(|it| match &it.command {
+                None => Err(anyhow!("expected a command, found none")),
+                Some(cmd) => Ok(cmd.clone()),
             })
-            .filter(|c| c.is_ok())
             .collect();
+        // every item in `actions` should have a command, as we filtered the ones that didn't have
+        // one before. If we happen to encounter one that does not have a command, we just error,
+        // as this is unexpected behaviour and could potentially lead to triggering the incorrect
+        // code action, as the index may be incorrect.
+        let source = source?;
 
-        self.vim()?
-            .rpcclient
-            .notify("s:FZF", json!([source?, NOTIFICATION__FZFSinkCommand]))?;
+        self.present_actions("Code Lens Actions", &source, |idx| -> Result<()> {
+            self.handle_code_action_selection(&actions, idx)
+        })?;
 
         Ok(Value::Null)
     }
 
-    pub fn textDocument_codeLens(&self, params: &Value) -> Fallible<Value> {
+    pub fn progress(&self, params: &Value) -> Result<()> {
+        let params = ProgressParams::deserialize(params)?;
+        let message = match params.value {
+            ProgressParamsValue::WorkDone(wd) => match wd {
+                WorkDoneProgress::Begin(r) => {
+                    Some(format!("{} {}", r.title, r.message.unwrap_or_default()))
+                }
+                WorkDoneProgress::Report(r) => r.message,
+                // WorkDoneProgress::End has no value, so we return Done, otherwise the previous
+                // message would be left in screen and it would appear as if it didn't ever finish.
+                WorkDoneProgress::End(_) => Some("Done".into()),
+            },
+        };
+
+        if message.is_none() {
+            return Ok(());
+        }
+
+        let token = match params.token {
+            // number is a not a particularly useful token to report to the user, so we just use
+            // INFO instead.
+            NumberOrString::Number(_) => "INFO".to_string(),
+            NumberOrString::String(s) => s,
+        };
+
+        let message = format!("{}: {}", token, message.unwrap_or_default());
+        self.vim()?.echomsg(&message)?;
+        Ok(())
+    }
+
+    pub fn text_document_code_lens(&self, params: &Value) -> Result<Value> {
         let use_virtual_text = self.get(|state| state.use_virtual_text.clone())?;
         if UseVirtualText::No == use_virtual_text || UseVirtualText::Diagnostics == use_virtual_text
         {
@@ -2075,7 +2067,7 @@ impl LanguageClient {
         }
 
         let filename = self.vim()?.get_filename(params)?;
-        let language_id = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let capabilities = self.get(|state| state.capabilities.clone())?;
         if let Some(initialize_result) = capabilities.get(&language_id) {
             // XXX: the capabilities state field stores the initialize result, not the capabilities
@@ -2085,9 +2077,9 @@ impl LanguageClient {
             let capabilities = initialize_result.capabilities;
 
             if let Some(code_lens_provider) = capabilities.code_lens_provider {
-                info!("Begin {}", lsp::request::CodeLensRequest::METHOD);
+                info!("Begin {}", lsp_types::request::CodeLensRequest::METHOD);
                 let client = self.get_client(&Some(language_id))?;
-                let input = lsp::CodeLensParams {
+                let input = lsp_types::CodeLensParams {
                     text_document: TextDocumentIdentifier {
                         uri: filename.to_url()?,
                     },
@@ -2095,7 +2087,8 @@ impl LanguageClient {
                     partial_result_params: PartialResultParams::default(),
                 };
 
-                let results: Value = client.call(lsp::request::CodeLensRequest::METHOD, &input)?;
+                let results: Value =
+                    client.call(lsp_types::request::CodeLensRequest::METHOD, &input)?;
                 let code_lens: Option<Vec<CodeLens>> = serde_json::from_value(results)?;
                 let mut code_lens: Vec<CodeLens> = code_lens.unwrap_or_default();
 
@@ -2108,7 +2101,7 @@ impl LanguageClient {
                             }
 
                             client
-                                .call(lsp::request::CodeLensResolve::METHOD, &cl)
+                                .call(lsp_types::request::CodeLensResolve::METHOD, &cl)
                                 .unwrap_or(cl)
                         })
                         .collect();
@@ -2119,31 +2112,32 @@ impl LanguageClient {
                     Ok(Value::Null)
                 })?;
 
-                info!("End {}", lsp::request::CodeLensRequest::METHOD);
+                info!("End {}", lsp_types::request::CodeLensRequest::METHOD);
             } else {
                 info!(
                     "CodeLens not supported. Skipping {}",
-                    lsp::request::CodeLensRequest::METHOD
+                    lsp_types::request::CodeLensRequest::METHOD
                 );
             }
         }
 
-        let bufnr = self.vim()?.get_bufnr(&filename, params)?;
-        let viewport = self.vim()?.get_viewport(params)?;
-        self.draw_virtual_texts(&filename, viewport, bufnr)?;
+        self.draw_virtual_texts(&params)?;
 
         Ok(Value::Null)
     }
 
-    pub fn textDocument_didOpen(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", lsp::notification::DidOpenTextDocument::METHOD);
+    pub fn text_document_did_open(&self, params: &Value) -> Result<()> {
+        info!(
+            "Begin {}",
+            lsp_types::notification::DidOpenTextDocument::METHOD
+        );
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let text = self.vim()?.get_text(&filename)?;
 
         let text_document = TextDocumentItem {
             uri: filename.to_url()?,
-            language_id: languageId.clone(),
+            language_id: language_id.clone(),
             version: 0,
             text: text.join("\n"),
         };
@@ -2154,14 +2148,14 @@ impl LanguageClient {
                 .insert(filename.clone(), text_document.clone()))
         })?;
 
-        self.get_client(&Some(languageId.clone()))?.notify(
-            lsp::notification::DidOpenTextDocument::METHOD,
+        self.get_client(&Some(language_id.clone()))?.notify(
+            lsp_types::notification::DidOpenTextDocument::METHOD,
             DidOpenTextDocumentParams { text_document },
         )?;
 
         self.vim()?
             .command("setlocal omnifunc=LanguageClient#complete")?;
-        let root = self.get(|state| state.roots.get(&languageId).cloned().unwrap_or_default())?;
+        let root = self.get(|state| state.roots.get(&language_id).cloned().unwrap_or_default())?;
         self.vim()?.rpcclient.notify(
             "setbufvar",
             json!([filename, "LanguageClient_projectRoot", root]),
@@ -2170,19 +2164,25 @@ impl LanguageClient {
             .rpcclient
             .notify("s:ExecuteAutocmd", "LanguageClientTextDocumentDidOpenPost")?;
 
-        self.textDocument_codeLens(params)?;
+        self.text_document_code_lens(params)?;
 
-        info!("End {}", lsp::notification::DidOpenTextDocument::METHOD);
+        info!(
+            "End {}",
+            lsp_types::notification::DidOpenTextDocument::METHOD
+        );
         Ok(())
     }
 
-    pub fn textDocument_didChange(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", lsp::notification::DidChangeTextDocument::METHOD);
+    pub fn text_document_did_change(&self, params: &Value) -> Result<()> {
+        info!(
+            "Begin {}",
+            lsp_types::notification::DidChangeTextDocument::METHOD
+        );
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         if !self.get(|state| state.text_documents.contains_key(&filename))? {
             info!("Not opened yet. Switching to didOpen.");
-            return self.textDocument_didOpen(params);
+            return self.text_document_did_open(params);
         }
 
         let text = self.vim()?.get_text(&filename)?.join("\n");
@@ -2199,9 +2199,10 @@ impl LanguageClient {
         }
 
         let version = self.update(|state| {
-            let document = state.text_documents.get_mut(&filename).ok_or_else(|| {
-                format_err!("Failed to get TextDocumentItem! filename: {}", filename)
-            })?;
+            let document = state
+                .text_documents
+                .get_mut(&filename)
+                .ok_or_else(|| anyhow!("Failed to get TextDocumentItem! filename: {}", filename))?;
 
             let version = document.version + 1;
             document.version = version;
@@ -2217,8 +2218,8 @@ impl LanguageClient {
             Ok(version)
         })?;
 
-        self.get_client(&Some(languageId))?.notify(
-            lsp::notification::DidChangeTextDocument::METHOD,
+        self.get_client(&Some(language_id))?.notify(
+            lsp_types::notification::DidChangeTextDocument::METHOD,
             DidChangeTextDocumentParams {
                 text_document: VersionedTextDocumentIdentifier {
                     uri: filename.to_url()?,
@@ -2232,54 +2233,74 @@ impl LanguageClient {
             },
         )?;
 
-        self.textDocument_codeLens(params)?;
+        self.text_document_code_lens(params)?;
 
-        info!("End {}", lsp::notification::DidChangeTextDocument::METHOD);
+        info!(
+            "End {}",
+            lsp_types::notification::DidChangeTextDocument::METHOD
+        );
         Ok(())
     }
 
-    pub fn textDocument_didSave(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", lsp::notification::DidSaveTextDocument::METHOD);
+    pub fn text_document_did_save(&self, params: &Value) -> Result<()> {
+        info!(
+            "Begin {}",
+            lsp_types::notification::DidSaveTextDocument::METHOD
+        );
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
-        if !self.get(|state| state.serverCommands.contains_key(&languageId))? {
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
+        if !self.get(|state| state.server_commands.contains_key(&language_id))? {
             return Ok(());
         }
 
         let uri = filename.to_url()?;
 
-        self.get_client(&Some(languageId))?.notify(
-            lsp::notification::DidSaveTextDocument::METHOD,
+        self.get_client(&Some(language_id))?.notify(
+            lsp_types::notification::DidSaveTextDocument::METHOD,
             DidSaveTextDocumentParams {
                 text_document: TextDocumentIdentifier { uri },
             },
         )?;
 
-        info!("End {}", lsp::notification::DidSaveTextDocument::METHOD);
+        self.draw_virtual_texts(params)?;
+
+        info!(
+            "End {}",
+            lsp_types::notification::DidSaveTextDocument::METHOD
+        );
         Ok(())
     }
 
-    pub fn textDocument_didClose(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", lsp::notification::DidCloseTextDocument::METHOD);
+    pub fn text_document_did_close(&self, params: &Value) -> Result<()> {
+        info!(
+            "Begin {}",
+            lsp_types::notification::DidCloseTextDocument::METHOD
+        );
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
 
-        self.get_client(&Some(languageId))?.notify(
-            lsp::notification::DidCloseTextDocument::METHOD,
+        self.get_client(&Some(language_id))?.notify(
+            lsp_types::notification::DidCloseTextDocument::METHOD,
             DidCloseTextDocumentParams {
                 text_document: TextDocumentIdentifier {
                     uri: filename.to_url()?,
                 },
             },
         )?;
-        info!("End {}", lsp::notification::DidCloseTextDocument::METHOD);
+        info!(
+            "End {}",
+            lsp_types::notification::DidCloseTextDocument::METHOD
+        );
         Ok(())
     }
 
-    pub fn textDocument_publishDiagnostics(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", lsp::notification::PublishDiagnostics::METHOD);
-        let params: PublishDiagnosticsParams = params.clone().to_lsp()?;
-        if !self.get(|state| state.diagnosticsEnable)? {
+    pub fn text_document_publish_diagnostics(&self, params: &Value) -> Result<()> {
+        info!(
+            "Begin {}",
+            lsp_types::notification::PublishDiagnostics::METHOD
+        );
+        let params = PublishDiagnosticsParams::deserialize(params)?;
+        if !self.get(|state| state.diagnostics_enable)? {
             return Ok(());
         }
 
@@ -2309,7 +2330,7 @@ impl LanguageClient {
         })?;
         self.update_quickfixlist()?;
 
-        let mut severityCount: HashMap<String, u64> = [
+        let mut severity_count: HashMap<String, u64> = [
             (
                 DiagnosticSeverity::Error
                     .to_quickfix_entry_type()
@@ -2345,7 +2366,7 @@ impl LanguageClient {
                 .unwrap_or(DiagnosticSeverity::Hint)
                 .to_quickfix_entry_type()
                 .to_string();
-            let count = severityCount.entry(severity).or_insert(0);
+            let count = severity_count.entry(severity).or_insert(0);
             *count += 1;
         }
 
@@ -2357,7 +2378,7 @@ impl LanguageClient {
             if bufnr > 0 {
                 self.vim()?.rpcclient.notify(
                     "setbufvar",
-                    json!([filename, VIM__StatusLineDiagnosticsCounts, severityCount]),
+                    json!([filename, VIM_STATUS_LINE_DIAGNOSTICS_COUNTS, severity_count]),
                 )?;
             }
         }
@@ -2381,18 +2402,24 @@ impl LanguageClient {
         });
 
         self.process_diagnostics(&current_filename, &diagnostics)?;
-        self.languageClient_handleCursorMoved(&Value::Null)?;
+        self.handle_cursor_moved(&Value::Null)?;
         self.vim()?
             .rpcclient
             .notify("s:ExecuteAutocmd", "LanguageClientDiagnosticsChanged")?;
 
-        info!("End {}", lsp::notification::PublishDiagnostics::METHOD);
+        info!(
+            "End {}",
+            lsp_types::notification::PublishDiagnostics::METHOD
+        );
         Ok(())
     }
 
-    pub fn textDocument_semanticHighlight(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", lsp::notification::SemanticHighlighting::METHOD);
-        let mut params: SemanticHighlightingParams = params.clone().to_lsp()?;
+    pub fn text_document_semantic_highlight(&self, params: &Value) -> Result<()> {
+        info!(
+            "Begin {}",
+            lsp_types::notification::SemanticHighlighting::METHOD
+        );
+        let mut params = SemanticHighlightingParams::deserialize(params)?;
 
         // TODO: Do we need to handle the versioning of the file?
         let mut filename = params
@@ -2407,12 +2434,12 @@ impl LanguageClient {
         }
         // Unify name to avoid mismatch due to case insensitivity.
         let filename = filename.canonicalize();
-        let languageId = self.vim()?.get_languageId(&filename, &Value::Null)?;
+        let language_id = self.vim()?.get_language_id(&filename, &Value::Null)?;
 
         let opt_hl_table = self.get(|state| {
             state
                 .semantic_scope_to_hl_group_table
-                .get(&languageId)
+                .get(&language_id)
                 .cloned()
         })?;
 
@@ -2524,9 +2551,9 @@ impl LanguageClient {
 
                 let old_semantic_hl_state = state
                     .semantic_highlights
-                    .insert(languageId.clone(), semantic_hl_state);
+                    .insert(language_id.clone(), semantic_hl_state);
 
-                let semantic_hl_state = state.semantic_highlights.get_mut(&languageId).unwrap();
+                let semantic_hl_state = state.semantic_highlights.get_mut(&language_id).unwrap();
 
                 let mut combined_hls = Vec::with_capacity(highlights.len());
 
@@ -2593,42 +2620,54 @@ impl LanguageClient {
             self.update(|state| {
                 state
                     .semantic_highlights
-                    .insert(languageId.clone(), semantic_hl_state);
+                    .insert(language_id.clone(), semantic_hl_state);
                 Ok(())
             })?;
         }
 
-        info!("End {}", lsp::notification::SemanticHighlighting::METHOD);
+        info!(
+            "End {}",
+            lsp_types::notification::SemanticHighlighting::METHOD
+        );
         Ok(())
     }
 
-    pub fn window_logMessage(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", lsp::notification::LogMessage::METHOD);
-        let params: LogMessageParams = params.clone().to_lsp()?;
-        let threshold = self.get(|state| state.windowLogMessageLevel.to_int())??;
-        if params.typ.to_int()? > threshold {
+    // logs a message to with the specified level to the log file if the threshold is below the
+    // message's level.
+    pub fn window_log_message(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", lsp_types::notification::LogMessage::METHOD);
+        let params = LogMessageParams::deserialize(params)?;
+        let threshold = self.get(|state| state.window_log_message_level)?;
+        if params.typ.to_int()? > threshold.to_int()? {
             return Ok(());
         }
 
-        let msg = format!("[{:?}] {}", params.typ, params.message);
-        self.vim()?.echomsg(&msg)?;
-        info!("End {}", lsp::notification::LogMessage::METHOD);
+        match threshold {
+            MessageType::Error => error!("{}", params.message),
+            MessageType::Warning => warn!("{}", params.message),
+            MessageType::Info => info!("{}", params.message),
+            MessageType::Log => debug!("{}", params.message),
+        };
+
+        info!("End {}", lsp_types::notification::LogMessage::METHOD);
         Ok(())
     }
 
-    pub fn window_showMessage(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", lsp::notification::ShowMessage::METHOD);
-        let params: ShowMessageParams = params.clone().to_lsp()?;
+    // shows the given message in vim.
+    pub fn window_show_message(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", lsp_types::notification::ShowMessage::METHOD);
+        let params = ShowMessageParams::deserialize(params)?;
         let msg = format!("[{:?}] {}", params.typ, params.message);
         self.vim()?.echomsg(&msg)?;
-        info!("End {}", lsp::notification::ShowMessage::METHOD);
+        info!("End {}", lsp_types::notification::ShowMessage::METHOD);
         Ok(())
     }
 
-    pub fn window_showMessageRequest(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", lsp::request::ShowMessageRequest::METHOD);
+    // TODO: change this to use the show_acions method
+    pub fn window_show_message_request(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", lsp_types::request::ShowMessageRequest::METHOD);
         let mut v = Value::Null;
-        let msg_params: ShowMessageRequestParams = params.clone().to_lsp()?;
+        let msg_params = ShowMessageRequestParams::deserialize(params)?;
         let msg = format!("[{:?}] {}", msg_params.typ, msg_params.message);
         let msg_actions = msg_params.actions.unwrap_or_default();
         if msg_actions.is_empty() {
@@ -2649,31 +2688,31 @@ impl LanguageClient {
             }
         }
 
-        info!("End {}", lsp::request::ShowMessageRequest::METHOD);
+        info!("End {}", lsp_types::request::ShowMessageRequest::METHOD);
         Ok(v)
     }
 
-    pub fn client_registerCapability(&self, languageId: &str, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", lsp::request::RegisterCapability::METHOD);
-        let params: RegistrationParams = params.clone().to_lsp()?;
+    pub fn client_register_capability(&self, language_id: &str, params: &Value) -> Result<Value> {
+        info!("Begin {}", lsp_types::request::RegisterCapability::METHOD);
+        let params = RegistrationParams::deserialize(params)?;
         for r in &params.registrations {
             match r.method.as_str() {
-                lsp::notification::DidChangeWatchedFiles::METHOD => {
+                lsp_types::notification::DidChangeWatchedFiles::METHOD => {
                     let opt: DidChangeWatchedFilesRegistrationOptions =
                         serde_json::from_value(r.register_options.clone().unwrap_or_default())?;
-                    if !self.get(|state| state.watchers.contains_key(languageId))? {
+                    if !self.get(|state| state.watchers.contains_key(language_id))? {
                         let (watcher_tx, watcher_rx) = mpsc::channel();
                         // TODO: configurable duration.
                         let watcher = notify::watcher(watcher_tx, Duration::from_secs(2))?;
                         self.update(|state| {
-                            state.watchers.insert(languageId.to_owned(), watcher);
-                            state.watcher_rxs.insert(languageId.to_owned(), watcher_rx);
+                            state.watchers.insert(language_id.to_owned(), watcher);
+                            state.watcher_rxs.insert(language_id.to_owned(), watcher_rx);
                             Ok(())
                         })?;
                     }
 
                     self.update(|state| {
-                        if let Some(ref mut watcher) = state.watchers.get_mut(languageId) {
+                        if let Some(ref mut watcher) = state.watchers.get_mut(language_id) {
                             for w in &opt.watchers {
                                 let recursive_mode = if w.glob_pattern.ends_with("**") {
                                     notify::RecursiveMode::Recursive
@@ -2697,13 +2736,13 @@ impl LanguageClient {
             state.registrations.extend(params.registrations);
             Ok(())
         })?;
-        info!("End {}", lsp::request::RegisterCapability::METHOD);
+        info!("End {}", lsp_types::request::RegisterCapability::METHOD);
         Ok(Value::Null)
     }
 
-    pub fn client_unregisterCapability(&self, languageId: &str, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", lsp::request::UnregisterCapability::METHOD);
-        let params: UnregistrationParams = params.clone().to_lsp()?;
+    pub fn client_unregister_capability(&self, language_id: &str, params: &Value) -> Result<Value> {
+        info!("Begin {}", lsp_types::request::UnregisterCapability::METHOD);
+        let params = UnregistrationParams::deserialize(params)?;
         let mut regs_removed = vec![];
         for r in &params.unregisterations {
             if let Some(idx) = self.get(|state| {
@@ -2718,11 +2757,11 @@ impl LanguageClient {
 
         for r in &regs_removed {
             match r.method.as_str() {
-                lsp::notification::DidChangeWatchedFiles::METHOD => {
+                lsp_types::notification::DidChangeWatchedFiles::METHOD => {
                     let opt: DidChangeWatchedFilesRegistrationOptions =
                         serde_json::from_value(r.register_options.clone().unwrap_or_default())?;
                     self.update(|state| {
-                        if let Some(ref mut watcher) = state.watchers.get_mut(languageId) {
+                        if let Some(ref mut watcher) = state.watchers.get_mut(language_id) {
                             for w in opt.watchers {
                                 watcher.unwatch(w.glob_pattern)?;
                             }
@@ -2736,96 +2775,96 @@ impl LanguageClient {
             }
         }
 
-        info!("End {}", lsp::request::UnregisterCapability::METHOD);
+        info!("End {}", lsp_types::request::UnregisterCapability::METHOD);
         Ok(Value::Null)
     }
 
-    pub fn exit(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", lsp::notification::Exit::METHOD);
+    pub fn exit(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", lsp_types::notification::Exit::METHOD);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
 
         let result = self
-            .get_client(&Some(languageId.clone()))?
-            .notify(lsp::notification::Exit::METHOD, Value::Null);
+            .get_client(&Some(language_id.clone()))?
+            .notify(lsp_types::notification::Exit::METHOD, Value::Null);
         if let Err(err) = result {
             error!("Error: {:?}", err);
         }
 
         self.vim()?
             .rpcclient
-            .notify("setbufvar", json!([filename, VIM__IsServerRunning, 0]))?;
+            .notify("setbufvar", json!([filename, VIM_IS_SERVER_RUNNING, 0]))?;
 
-        if let Err(err) = self.cleanup(&languageId) {
+        if let Err(err) = self.cleanup(&language_id) {
             error!("Error: {:?}", err);
         }
-        info!("End {}", lsp::notification::Exit::METHOD);
+        info!("End {}", lsp_types::notification::Exit::METHOD);
         Ok(())
     }
 
     /////// Extensions by this plugin ///////
 
-    pub fn languageClient_getState(&self, _params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__GetState);
+    pub fn get_state(&self, _params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_GET_STATE);
         let s = self.get(|state| serde_json::to_string(state))??;
-        info!("End {}", REQUEST__GetState);
+        info!("End {}", REQUEST_GET_STATE);
         Ok(Value::String(s))
     }
 
-    pub fn languageClient_isAlive(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__IsAlive);
+    pub fn is_alive(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_IS_ALIVE);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
-        let is_alive = self.get(|state| state.clients.contains_key(&Some(languageId.clone())))?;
-        info!("End {}", REQUEST__IsAlive);
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
+        let is_alive = self.get(|state| state.clients.contains_key(&Some(language_id.clone())))?;
+        info!("End {}", REQUEST_IS_ALIVE);
         Ok(Value::Bool(is_alive))
     }
 
-    pub fn languageClient_registerServerCommands(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__RegisterServerCommands);
-        let commands: HashMap<String, Vec<String>> = params.clone().to_lsp()?;
+    pub fn register_server_commands(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_REGISTER_SERVER_COMMANDS);
+        let commands = HashMap::<String, Vec<String>>::deserialize(params)?;
         self.update(|state| {
-            state.serverCommands.extend(commands);
+            state.server_commands.extend(commands);
             Ok(())
         })?;
         let exp = format!(
             "let g:LanguageClient_serverCommands={}",
-            serde_json::to_string(&self.get(|state| state.serverCommands.clone())?)?
+            serde_json::to_string(&self.get(|state| state.server_commands.clone())?)?
         );
         self.vim()?.command(&exp)?;
-        info!("End {}", REQUEST__RegisterServerCommands);
+        info!("End {}", REQUEST_REGISTER_SERVER_COMMANDS);
         Ok(Value::Null)
     }
 
-    pub fn languageClient_setLoggingLevel(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__SetLoggingLevel);
-        let loggingLevel =
-            try_get("loggingLevel", params)?.ok_or_else(|| err_msg("loggingLevel not found!"))?;
+    pub fn set_logging_level(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_SET_LOGGING_LEVEL);
+        let logging_level =
+            try_get("loggingLevel", params)?.ok_or_else(|| anyhow!("loggingLevel not found!"))?;
         self.update(|state| {
-            state.logger.set_level(loggingLevel)?;
+            state.logger.set_level(logging_level)?;
             Ok(())
         })?;
-        info!("End {}", REQUEST__SetLoggingLevel);
+        info!("End {}", REQUEST_SET_LOGGING_LEVEL);
         Ok(Value::Null)
     }
 
-    pub fn languageClient_setDiagnosticsList(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__SetDiagnosticsList);
-        let diagnosticsList = try_get("diagnosticsList", params)?
-            .ok_or_else(|| err_msg("diagnosticsList not found!"))?;
+    pub fn set_diagnostics_list(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_SET_DIAGNOSTICS_LIST);
+        let diagnostics_list = try_get("diagnosticsList", params)?
+            .ok_or_else(|| anyhow!("diagnosticsList not found!"))?;
         self.update(|state| {
-            state.diagnosticsList = diagnosticsList;
+            state.diagnostics_list = diagnostics_list;
             Ok(())
         })?;
-        info!("End {}", REQUEST__SetDiagnosticsList);
+        info!("End {}", REQUEST_SET_DIAGNOSTICS_LIST);
         Ok(Value::Null)
     }
 
-    pub fn languageClient_registerHandlers(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__RegisterHandlers);
-        let handlers: Fallible<HashMap<String, String>> = params
+    pub fn register_handlers(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_REGISTER_HANDLERS);
+        let handlers: Result<HashMap<String, String>> = params
             .as_object()
-            .ok_or_else(|| err_msg("Invalid arguments!"))?
+            .ok_or_else(|| anyhow!("Invalid arguments!"))?
             .iter()
             .filter_map(|(k, v)| {
                 if *k == "bufnr" || *k == "languageId" {
@@ -2844,13 +2883,13 @@ impl LanguageClient {
             state.user_handlers.extend(handlers);
             Ok(())
         })?;
-        info!("End {}", REQUEST__RegisterHandlers);
+        info!("End {}", REQUEST_REGISTER_HANDLERS);
         Ok(Value::Null)
     }
 
-    pub fn languageClient_omniComplete(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__OmniComplete);
-        let result = self.textDocument_completion(params)?;
+    pub fn omnicomplete(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_OMNI_COMPLETE);
+        let result = self.text_document_completion(params)?;
         let result: Option<CompletionResponse> = serde_json::from_value(result)?;
         let result = result.unwrap_or_else(|| CompletionResponse::Array(vec![]));
         let matches = match result {
@@ -2860,82 +2899,82 @@ impl LanguageClient {
 
         let complete_position: Option<u64> = try_get("complete_position", params)?;
 
-        let matches: Fallible<Vec<VimCompleteItem>> = matches
+        let matches: Result<Vec<VimCompleteItem>> = matches
             .iter()
             .map(|item| VimCompleteItem::from_lsp(item, complete_position))
             .collect();
         let matches = matches?;
-        info!("End {}", REQUEST__OmniComplete);
+        info!("End {}", REQUEST_OMNI_COMPLETE);
         Ok(serde_json::to_value(matches)?)
     }
 
-    pub fn languageClient_handleBufNewFile(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__HandleBufNewFile);
+    pub fn handle_buf_new_file(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_HANDLE_BUF_NEW_FILE);
         if self.vim()?.get_filename(params)?.is_empty() {
             return Ok(());
         }
 
-        let autoStart: u8 = self
+        let auto_start: u8 = self
             .vim()?
             .eval("!!get(g:, 'LanguageClient_autoStart', 1)")?;
-        if autoStart == 1 {
-            let ret = self.languageClient_startServer(params);
+        if auto_start == 1 {
+            let ret = self.start_server(params);
             // This is triggered from autocmd, silent all errors.
             if let Err(err) = ret {
                 warn!("Failed to start language server automatically. {}", err);
             }
         }
 
-        info!("End {}", NOTIFICATION__HandleBufNewFile);
+        info!("End {}", NOTIFICATION_HANDLE_BUF_NEW_FILE);
         Ok(())
     }
 
-    pub fn languageClient_handleBufEnter(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__HandleBufEnter);
+    pub fn handle_buf_enter(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_HANDLE_BUF_ENTER);
         if self.vim()?.get_filename(params)?.is_empty() {
             return Ok(());
         }
 
         let filename = self.vim()?.get_filename(params)?.canonicalize();
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
 
-        if self.get(|state| state.clients.contains_key(&Some(languageId.clone())))? {
+        if self.get(|state| state.clients.contains_key(&Some(language_id.clone())))? {
             self.vim()?
                 .rpcclient
-                .notify("setbufvar", json!([filename, VIM__IsServerRunning, 1]))?;
+                .notify("setbufvar", json!([filename, VIM_IS_SERVER_RUNNING, 1]))?;
         } else {
             self.vim()?
                 .rpcclient
-                .notify("setbufvar", json!([filename, VIM__IsServerRunning, 0]))?;
+                .notify("setbufvar", json!([filename, VIM_IS_SERVER_RUNNING, 0]))?;
         }
-        info!("End {}", NOTIFICATION__HandleBufEnter);
+        info!("End {}", NOTIFICATION_HANDLE_BUF_ENTER);
         Ok(())
     }
 
-    pub fn languageClient_handleFileType(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__HandleFileType);
+    pub fn handle_file_type(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_HANDLE_FILE_TYPE);
         if self.vim()?.get_filename(params)?.is_empty() {
             return Ok(());
         }
 
         let filename = self.vim()?.get_filename(params)?.canonicalize();
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
 
-        if self.get(|state| state.clients.contains_key(&Some(languageId.clone())))? {
-            self.textDocument_didOpen(params)?;
+        if self.get(|state| state.clients.contains_key(&Some(language_id.clone())))? {
+            self.text_document_did_open(params)?;
 
             if let Some(diagnostics) =
                 self.get(|state| state.diagnostics.get(&filename).cloned())?
             {
                 self.process_diagnostics(&filename, &diagnostics)?;
-                self.languageClient_handleCursorMoved(params)?;
+                self.handle_cursor_moved(params)?;
             }
         } else {
-            let autoStart: u8 = self
+            let auto_start: u8 = self
                 .vim()?
                 .eval("!!get(g:, 'LanguageClient_autoStart', 1)")?;
-            if autoStart == 1 {
-                let ret = self.languageClient_startServer(params);
+            if auto_start == 1 {
+                let ret = self.start_server(params);
                 // This is triggered from autocmd, silent all errors.
                 if let Err(err) = ret {
                     warn!("Failed to start language server automatically. {}", err);
@@ -2943,15 +2982,15 @@ impl LanguageClient {
             }
         }
 
-        info!("End {}", NOTIFICATION__HandleFileType);
+        info!("End {}", NOTIFICATION_HANDLE_FILE_TYPE);
         Ok(())
     }
 
-    pub fn languageClient_handleTextChanged(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__HandleTextChanged);
+    pub fn handle_text_changed(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_HANDLE_TEXT_CHANGED);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
-        if !self.get(|state| state.serverCommands.contains_key(&languageId))? {
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
+        if !self.get(|state| state.server_commands.contains_key(&language_id))? {
             return Ok(());
         }
 
@@ -2970,23 +3009,23 @@ impl LanguageClient {
             return Ok(());
         }
 
-        self.textDocument_didChange(params)?;
-        info!("End {}", NOTIFICATION__HandleTextChanged);
+        self.text_document_did_change(params)?;
+        info!("End {}", NOTIFICATION_HANDLE_TEXT_CHANGED);
         Ok(())
     }
 
-    pub fn languageClient_handleBufWritePost(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__HandleBufWritePost);
-        self.textDocument_didSave(params)?;
-        info!("End {}", NOTIFICATION__HandleBufWritePost);
+    pub fn handle_buf_write_post(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_HANDLE_BUF_WRITE_POST);
+        self.text_document_did_save(params)?;
+        info!("End {}", NOTIFICATION_HANDLE_BUF_WRITE_POST);
         Ok(())
     }
 
-    pub fn languageClient_handleBufDelete(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__HandleBufWritePost);
+    pub fn handle_buf_delete(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_HANDLE_BUF_WRITE_POST);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
-        if !self.get(|state| state.serverCommands.contains_key(&languageId))? {
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
+        if !self.get(|state| state.server_commands.contains_key(&language_id))? {
             return Ok(());
         }
 
@@ -2997,17 +3036,17 @@ impl LanguageClient {
             state.signs.retain(|f, _| f != &filename);
             Ok(())
         })?;
-        self.textDocument_didClose(params)?;
-        info!("End {}", NOTIFICATION__HandleBufWritePost);
+        self.text_document_did_close(params)?;
+        info!("End {}", NOTIFICATION_HANDLE_BUF_WRITE_POST);
         Ok(())
     }
 
-    pub fn languageClient_handleCursorMoved(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__HandleCursorMoved);
+    pub fn handle_cursor_moved(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_HANDLE_CURSOR_MOVED);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let line = self.vim()?.get_position(params)?.line;
-        if !self.get(|state| state.serverCommands.contains_key(&languageId))? {
+        if !self.get(|state| state.server_commands.contains_key(&language_id))? {
             return Ok(());
         }
         if !self.get(|state| state.diagnostics.contains_key(&filename))?
@@ -3059,7 +3098,7 @@ impl LanguageClient {
             diagnostics.dedup_by_key(|diag| diag.range.start.line);
             Ok(diagnostics
                 .into_iter()
-                .take(state.diagnosticsSignsMax.unwrap_or(std::usize::MAX))
+                .take(state.diagnostics_signs_max.unwrap_or(std::usize::MAX))
                 .map(Into::into)
                 .collect())
         })?;
@@ -3105,7 +3144,7 @@ impl LanguageClient {
             Ok(state
                 .highlights
                 .entry(filename.clone())
-                .or_insert_with(|| vec![])
+                .or_insert_with(Vec::new)
                 .iter()
                 .filter_map(|h| {
                     if h.line < viewport.start || h.line > viewport.end {
@@ -3152,19 +3191,34 @@ impl LanguageClient {
                 .notify("s:AddHighlights", json!([source, highlights]))?;
         }
 
-        let bufnr = self.vim()?.get_bufnr(&filename, params)?;
-        self.draw_virtual_texts(&filename, viewport, bufnr)?;
+        self.draw_virtual_texts(&params)?;
 
-        info!("End {}", NOTIFICATION__HandleCursorMoved);
+        info!("End {}", NOTIFICATION_HANDLE_CURSOR_MOVED);
         Ok(())
     }
 
-    fn draw_virtual_texts(
-        &self,
-        filename: &str,
-        viewport: viewport::Viewport,
-        bufnr: i64,
-    ) -> Fallible<()> {
+    fn draw_virtual_texts(&self, params: &Value) -> Result<()> {
+        if !self.get(|state| state.is_nvim)? {
+            return Ok(());
+        }
+
+        let filename = self.vim()?.get_filename(params)?;
+        let filename = filename.as_str();
+        let viewport = self.vim()?.get_viewport(params)?;
+        let bufnr = self.vim()?.get_bufnr(&filename, params)?;
+        let namespace_id = self.get_or_create_namespace(&LCNamespace::VirtualText)?;
+        let is_insert_mode = self.vim()?.get_mode()? == Mode::Insert;
+        if self.get(|state| state.hide_virtual_texts_on_insert)? && is_insert_mode {
+            self.vim()?.set_virtual_texts(
+                bufnr,
+                namespace_id,
+                viewport.start,
+                viewport.end,
+                &[],
+            )?;
+            return Ok(());
+        }
+
         let mut virtual_texts = vec![];
         let use_virtual_text = self.get(|state| state.use_virtual_text.clone())?;
 
@@ -3183,16 +3237,13 @@ impl LanguageClient {
             virtual_texts.extend(self.virtual_texts_from_code_lenses(filename)?.into_iter());
         }
 
-        if self.get(|state| state.is_nvim)? {
-            let namespace_id = self.get_or_create_namespace(&LCNamespace::VirtualText)?;
-            self.vim()?.set_virtual_texts(
-                bufnr,
-                namespace_id,
-                viewport.start,
-                viewport.end,
-                &virtual_texts,
-            )?;
-        }
+        self.vim()?.set_virtual_texts(
+            bufnr,
+            namespace_id,
+            viewport.start,
+            viewport.end,
+            &virtual_texts,
+        )?;
 
         Ok(())
     }
@@ -3201,21 +3252,25 @@ impl LanguageClient {
         &self,
         filename: &str,
         viewport: viewport::Viewport,
-    ) -> Fallible<Vec<VirtualText>> {
+    ) -> Result<Vec<VirtualText>> {
         let mut virtual_texts = vec![];
         let diagnostics = self.get(|state| state.diagnostics.clone())?;
-        let diagnosticsDisplay = self.get(|state| state.diagnosticsDisplay.clone())?;
+        let diagnostics_display = self.get(|state| state.diagnostics_display.clone())?;
         let diag_list = diagnostics.get(filename);
         if let Some(diag_list) = diag_list {
             for diag in diag_list {
                 if viewport.overlaps(diag.range) {
+                    let mut explanation = diag.message.clone();
+                    if let Some(source) = &diag.source {
+                        explanation = format!("{}: {}\n", source, explanation);
+                    }
                     virtual_texts.push(VirtualText {
                         line: diag.range.start.line,
-                        text: diag.message.replace("\n", "  ").clone(),
-                        hl_group: diagnosticsDisplay
+                        text: explanation.replace("\n", "  "),
+                        hl_group: diagnostics_display
                             .get(&(diag.severity.unwrap_or(DiagnosticSeverity::Hint) as u64))
-                            .ok_or_else(|| err_msg("Failed to get display"))?
-                            .virtualTexthl
+                            .ok_or_else(|| anyhow!("Failed to get display"))?
+                            .virtual_texthl
                             .clone(),
                     });
                 }
@@ -3225,7 +3280,7 @@ impl LanguageClient {
         Ok(virtual_texts)
     }
 
-    fn virtual_texts_from_code_lenses(&self, filename: &str) -> Fallible<Vec<VirtualText>> {
+    fn virtual_texts_from_code_lenses(&self, filename: &str) -> Result<Vec<VirtualText>> {
         let mut virtual_texts = vec![];
         let code_lenses =
             self.get(|state| state.code_lens.get(filename).cloned().unwrap_or_default())?;
@@ -3254,11 +3309,11 @@ impl LanguageClient {
         Ok(virtual_texts)
     }
 
-    pub fn languageClient_handleCompleteDone(&self, params: &Value) -> Fallible<()> {
+    pub fn handle_complete_done(&self, params: &Value) -> Result<()> {
         let filename = self.vim()?.get_filename(params)?;
         let position = self.vim()?.get_position(params)?;
         let completed_item: VimCompleteItem = try_get("completed_item", params)?
-            .ok_or_else(|| err_msg("completed_item not found!"))?;
+            .ok_or_else(|| anyhow!("completed_item not found!"))?;
 
         let user_data = match completed_item.user_data {
             Some(user_data) => user_data,
@@ -3271,8 +3326,12 @@ impl LanguageClient {
         };
 
         let mut edits = vec![];
-        if self.get(|state| state.completionPreferTextEdit)? {
-            if let Some(edit) = lspitem.text_edit {
+        if self.get(|state| state.completion_prefer_text_edit)? {
+            if let Some(CompletionTextEdit::InsertAndReplace(_)) = lspitem.text_edit {
+                error!("insert and replace is not supported");
+            }
+
+            if let Some(CompletionTextEdit::Edit(edit)) = lspitem.text_edit {
                 // The text edit should be at the completion point, and deleting the partial text
                 // that the user had typed when the language server provided the completion.
                 //
@@ -3287,10 +3346,10 @@ impl LanguageClient {
                     return Ok(());
                 }
                 edits.push(edit);
-            };
+            }
         }
 
-        if self.get(|state| state.applyCompletionAdditionalTextEdits)? {
+        if self.get(|state| state.apply_completion_additional_text_edits)? {
             if let Some(aedits) = lspitem.additional_text_edits {
                 edits.extend(aedits);
             };
@@ -3300,32 +3359,32 @@ impl LanguageClient {
             return Ok(());
         }
 
-        let position = self.apply_TextEdits(filename, &edits, position)?;
+        let position = self.apply_text_edits(filename, &edits, position)?;
         self.vim()?
             .cursor(position.line + 1, position.character + 1)
     }
 
-    pub fn languageClient_FZFSinkLocation(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__FZFSinkLocation);
+    pub fn fzf_sink_location(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_FZF_SINK_LOCATION);
         let params = match params {
             Value::Array(ref arr) => Value::Array(arr.clone()),
             _ => {
-                bail!("Expecting array params!");
+                return Err(anyhow!("Expecting array params!"));
             }
         };
 
         let lines: Vec<String> = serde_json::from_value(params.clone())?;
         if lines.is_empty() {
-            err_msg("No selection!");
+            anyhow!("No selection!");
         }
         let cmd = lines.get(0).ok_or_else(|| format_err!("Failed to get action! lines: {:?}", lines))?.to_owned();
 
         let location = lines
             .get(1)
-            .ok_or_else(|| format_err!("Failed to get line! lines: {:?}", lines))?
+            .ok_or_else(|| anyhow!("Failed to get line! lines: {:?}", lines))?
             .split('\t')
             .next()
-            .ok_or_else(|| format_err!("Failed to parse: {:?}", lines))?;
+            .ok_or_else(|| anyhow!("Failed to parse: {:?}", lines))?;
         let tokens: Vec<_> = location.split_terminator(':').collect();
 
         let (filename, mut tokens_iter): (String, _) = if tokens.len() > 2 {
@@ -3339,88 +3398,63 @@ impl LanguageClient {
 
         let line = tokens_iter
             .next()
-            .ok_or_else(|| format_err!("Failed to get line! tokens: {:?}", tokens))?
+            .ok_or_else(|| anyhow!("Failed to get line! tokens: {:?}", tokens))?
             .to_int()?
             - 1;
         let character = tokens_iter
             .next()
-            .ok_or_else(|| format_err!("Failed to get character! tokens: {:?}", tokens))?
+            .ok_or_else(|| anyhow!("Failed to get character! tokens: {:?}", tokens))?
             .to_int()?
             - 1;
 
         self.edit(&Some(cmd), &filename)?;
         self.vim()?.cursor(line + 1, character + 1)?;
 
-        info!("End {}", NOTIFICATION__FZFSinkLocation);
+        info!("End {}", NOTIFICATION_FZF_SINK_LOCATION);
         Ok(())
     }
 
-    pub fn languageClient_FZFSinkCommand(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__FZFSinkCommand);
+    pub fn fzf_sink_command(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_FZF_SINK_COMMAND);
         let selection: String =
-            try_get("selection", params)?.ok_or_else(|| err_msg("selection not found!"))?;
+            try_get("selection", params)?.ok_or_else(|| anyhow!("selection not found!"))?;
         let tokens: Vec<&str> = selection.splitn(2, ": ").collect();
         let kind = tokens
             .get(0)
             .cloned()
-            .ok_or_else(|| format_err!("Failed to get kind! tokens: {:?}", tokens))?;
+            .ok_or_else(|| anyhow!("Failed to get title! tokens: {:?}", tokens))?;
         let title = tokens
             .get(1)
             .cloned()
-            .ok_or_else(|| format_err!("Failed to get title! tokens: {:?}", tokens))?;
-        let action = self.get(|state| {
-            let actions = &state.stashed_codeAction_actions;
+            .ok_or_else(|| anyhow!("Failed to get kind! tokens: {:?}", tokens))?;
+        let actions = self.get(|state| state.stashed_code_action_actions.clone())?;
+        let idx = actions
+            .iter()
+            .position(|it| code_action_kind_as_str(&it) == kind && it.title == title);
 
-            actions
-                .iter()
-                .find(|action| {
-                    action.kind.as_ref().map_or(kind, String::as_ref) == kind
-                        && action.title == title
-                })
-                .cloned()
-                .ok_or_else(|| {
-                    format_err!("No stashed action found! stashed actions: {:?}", actions)
-                })
-        })??;
+        match idx {
+            Some(idx) => self.handle_code_action_selection(&actions, idx)?,
+            None => return Err(anyhow!("Action not stashed, please try again")),
+        };
 
-        // Apply edit before command.
-        if let Some(edit) = &action.edit {
-            self.apply_WorkspaceEdit(edit)?;
-        }
-
-        if let Some(command) = &action.command {
-            if !self.try_handle_command_by_client(&command)? {
-                let params = json!({
-                "command": command.command,
-                "arguments": command.arguments,
-                });
-                self.workspace_executeCommand(&params)?;
-            }
-        }
-
-        self.update(|state| {
-            state.stashed_codeAction_actions = vec![];
-            Ok(())
-        })?;
-
-        info!("End {}", NOTIFICATION__FZFSinkCommand);
+        info!("End {}", NOTIFICATION_FZF_SINK_COMMAND);
         Ok(())
     }
 
-    pub fn languageClient_semanticScopes(&self, params: &Value) -> Fallible<Value> {
+    pub fn semantic_scopes(&self, params: &Value) -> Result<Value> {
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
 
         let (scopes, mut scope_mapping) = self.get(|state| {
             (
                 state
                     .semantic_scopes
-                    .get(&languageId)
+                    .get(&language_id)
                     .cloned()
                     .unwrap_or_default(),
                 state
                     .semantic_scope_to_hl_group_table
-                    .get(&languageId)
+                    .get(&language_id)
                     .cloned()
                     .unwrap_or_default(),
             )
@@ -3450,14 +3484,14 @@ impl LanguageClient {
         Ok(json!(semantic_scopes))
     }
 
-    pub fn languageClient_semanticHlSyms(&self, params: &Value) -> Fallible<Value> {
+    pub fn semantic_highlight_symbols(&self, params: &Value) -> Result<Value> {
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
 
         let (opt_scopes, opt_hl_state) = self.get(|state| {
             (
-                state.semantic_scopes.get(&languageId).cloned(),
-                state.semantic_highlights.get(&languageId).cloned(),
+                state.semantic_scopes.get(&language_id).cloned(),
+                state.semantic_highlights.get(&language_id).cloned(),
             )
         })?;
 
@@ -3481,9 +3515,10 @@ impl LanguageClient {
         }
     }
 
-    pub fn NCM_refresh(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__NCMRefresh);
-        let params: NCMRefreshParams = serde_json::from_value(rpc::to_value(params.clone())?)?;
+    pub fn ncm_refresh(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_NCM_REFRESH);
+        let params: NCMRefreshParams =
+            serde_json::from_value(jsonrpc_core::to_value(params.clone())?)?;
         let NCMRefreshParams { info, ctx } = params;
         if ctx.typed.is_empty() {
             return Ok(Value::Null);
@@ -3493,7 +3528,7 @@ impl LanguageClient {
         let line = ctx.lnum - 1;
         let character = ctx.col - 1;
 
-        let result = self.textDocument_completion(&json!({
+        let result = self.text_document_completion(&json!({
             "languageId": ctx.filetype,
             "filename": filename,
             "line": line,
@@ -3506,7 +3541,7 @@ impl LanguageClient {
             CompletionResponse::Array(_) => false,
             CompletionResponse::List(ref list) => list.is_incomplete,
         };
-        let matches: Fallible<Vec<VimCompleteItem>> = match result {
+        let matches: Result<Vec<VimCompleteItem>> = match result {
             CompletionResponse::Array(arr) => arr,
             CompletionResponse::List(list) => list.items,
         }
@@ -3518,14 +3553,14 @@ impl LanguageClient {
             "cm#complete",
             json!([info.name, ctx, ctx.startcol, matches, is_incomplete]),
         )?;
-        info!("End {}", REQUEST__NCMRefresh);
+        info!("End {}", REQUEST_NCM_REFRESH);
         Ok(Value::Null)
     }
 
-    pub fn NCM2_on_complete(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__NCM2OnComplete);
+    pub fn ncm2_on_complete(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_NCM2_ON_COMPLETE);
 
-        let orig_ctx: Value = serde_json::from_value(rpc::to_value(params.clone())?)?;
+        let orig_ctx: Value = serde_json::from_value(jsonrpc_core::to_value(params.clone())?)?;
         let orig_ctx = &orig_ctx["ctx"];
 
         let ctx: NCM2Context = serde_json::from_value(orig_ctx.clone())?;
@@ -3537,7 +3572,7 @@ impl LanguageClient {
         let line = ctx.lnum - 1;
         let character = ctx.ccol - 1;
 
-        let result = self.textDocument_completion(&json!({
+        let result = self.text_document_completion(&json!({
                 "languageId": ctx.filetype,
                 "filename": filename,
                 "line": line,
@@ -3551,7 +3586,7 @@ impl LanguageClient {
                 CompletionResponse::List(ref list) => list.is_incomplete,
                 _ => false,
             };
-            let matches_result: Fallible<Vec<VimCompleteItem>> = match completion {
+            let matches_result: Result<Vec<VimCompleteItem>> = match completion {
                 CompletionResponse::Array(arr) => arr,
                 CompletionResponse::List(list) => list.items,
             }
@@ -3567,24 +3602,24 @@ impl LanguageClient {
             "ncm2#complete",
             json!([orig_ctx, ctx.startccol, matches, is_incomplete]),
         )?;
-        info!("End {}", REQUEST__NCM2OnComplete);
+        info!("End {}", REQUEST_NCM2_ON_COMPLETE);
         result
     }
 
-    pub fn languageClient_explainErrorAtPoint(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__ExplainErrorAtPoint);
+    pub fn explain_error_at_point(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_EXPLAIN_ERROR_AT_POINT);
         let filename = self.vim()?.get_filename(params)?;
         let position = self.vim()?.get_position(params)?;
         let diag = self.get(|state| {
             state
                 .diagnostics
                 .get(&filename)
-                .ok_or_else(|| format_err!("No diagnostics found: filename: {}", filename,))?
+                .ok_or_else(|| anyhow!("No diagnostics found: filename: {}", filename,))?
                 .iter()
                 .find(|dn| position >= dn.range.start && position < dn.range.end)
                 .cloned()
                 .ok_or_else(|| {
-                    format_err!(
+                    anyhow!(
                         "No diagnostics found: filename: {}, line: {}, character: {}",
                         filename,
                         position.line,
@@ -3593,18 +3628,21 @@ impl LanguageClient {
                 })
         })??;
 
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
-        let root = self.get(|state| state.roots.get(&languageId).cloned().unwrap_or_default())?;
-        let rootUri = root.to_url()?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
+        let root = self.get(|state| state.roots.get(&language_id).cloned().unwrap_or_default())?;
+        let root_uri = root.to_url()?;
 
         let mut explanation = diag.message;
+        if let Some(source) = diag.source {
+            explanation = format!("{}: {}\n", source, explanation);
+        }
         if let Some(related_information) = diag.related_information {
             explanation = format!("{}\n", explanation);
             for ri in related_information {
-                let prefix = format!("{}/", rootUri);
+                let prefix = format!("{}/", root_uri);
                 let uri = if ri.location.uri.as_str().starts_with(prefix.as_str()) {
                     // Heuristic: if start of stringified URI matches rootUri, abbreviate it away
-                    &ri.location.uri.as_str()[rootUri.as_str().len() + 1..]
+                    &ri.location.uri.as_str()[root_uri.as_str().len() + 1..]
                 } else {
                     ri.location.uri.as_str()
                 };
@@ -3625,53 +3663,56 @@ impl LanguageClient {
 
         self.preview(explanation.as_str())?;
 
-        info!("End {}", REQUEST__ExplainErrorAtPoint);
+        info!("End {}", REQUEST_EXPLAIN_ERROR_AT_POINT);
         Ok(Value::Null)
     }
 
     // Extensions by language servers.
-    pub fn language_status(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__LanguageStatus);
-        let params: LanguageStatusParams = params.clone().to_lsp()?;
+    pub fn language_status(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_LANGUAGE_STATUS);
+        let params = LanguageStatusParams::deserialize(params)?;
         let msg = format!("{} {}", params.typee, params.message);
         self.vim()?.echomsg(&msg)?;
-        info!("End {}", NOTIFICATION__LanguageStatus);
+        info!("End {}", NOTIFICATION_LANGUAGE_STATUS);
         Ok(())
     }
 
-    pub fn rust_handleBeginBuild(&self, _params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__RustBeginBuild);
+    pub fn rust_handle_begin_build(&self, _params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_RUST_BEGIN_BUILD);
         self.vim()?.command(vec![
-            format!("let {}=1", VIM__ServerStatus),
-            format!("let {}='Rust: build begin'", VIM__ServerStatusMessage),
+            format!("let {}=1", VIM_SERVER_STATUS),
+            format!("let {}='Rust: build begin'", VIM_SERVER_STATUS_MESSAGE),
         ])?;
-        info!("End {}", NOTIFICATION__RustBeginBuild);
+        info!("End {}", NOTIFICATION_RUST_BEGIN_BUILD);
         Ok(())
     }
 
-    pub fn rust_handleDiagnosticsBegin(&self, _params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__RustDiagnosticsBegin);
+    pub fn rust_handle_diagnostics_begin(&self, _params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_RUST_DIAGNOSTICS_BEGIN);
         self.vim()?.command(vec![
-            format!("let {}=1", VIM__ServerStatus),
-            format!("let {}='Rust: diagnostics begin'", VIM__ServerStatusMessage),
+            format!("let {}=1", VIM_SERVER_STATUS),
+            format!(
+                "let {}='Rust: diagnostics begin'",
+                VIM_SERVER_STATUS_MESSAGE
+            ),
         ])?;
-        info!("End {}", NOTIFICATION__RustDiagnosticsBegin);
+        info!("End {}", NOTIFICATION_RUST_DIAGNOSTICS_BEGIN);
         Ok(())
     }
 
-    pub fn rust_handleDiagnosticsEnd(&self, _params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__RustDiagnosticsEnd);
+    pub fn rust_handle_diagnostics_end(&self, _params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_RUST_DIAGNOSTICS_END);
         self.vim()?.command(vec![
-            format!("let {}=0", VIM__ServerStatus),
-            format!("let {}='Rust: diagnostics end'", VIM__ServerStatusMessage),
+            format!("let {}=0", VIM_SERVER_STATUS),
+            format!("let {}='Rust: diagnostics end'", VIM_SERVER_STATUS_MESSAGE),
         ])?;
-        info!("End {}", NOTIFICATION__RustDiagnosticsEnd);
+        info!("End {}", NOTIFICATION_RUST_DIAGNOSTICS_END);
         Ok(())
     }
 
-    pub fn window_progress(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", NOTIFICATION__WindowProgress);
-        let params: WindowProgressParams = params.clone().to_lsp()?;
+    pub fn window_progress(&self, params: &Value) -> Result<()> {
+        info!("Begin {}", NOTIFICATION_WINDOW_PROGRESS);
+        let params = WindowProgressParams::deserialize(params)?;
 
         let done = params.done.unwrap_or(false);
 
@@ -3694,21 +3735,21 @@ impl LanguageClient {
         }
 
         self.vim()?.command(vec![
-            format!("let {}={}", VIM__ServerStatus, if done { 0 } else { 1 }),
+            format!("let {}={}", VIM_SERVER_STATUS, if done { 0 } else { 1 }),
             format!(
                 "let {}='{}'",
-                VIM__ServerStatusMessage,
+                VIM_SERVER_STATUS_MESSAGE,
                 &escape_single_quote(buf)
             ),
         ])?;
-        info!("End {}", NOTIFICATION__WindowProgress);
+        info!("End {}", NOTIFICATION_WINDOW_PROGRESS);
         Ok(())
     }
 
-    pub fn languageClient_startServer(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__StartServer);
+    pub fn start_server(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_START_SERVER);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let cmdargs: Vec<String> = try_get("cmdargs", params)?.unwrap_or_default();
         let cmdparams = vim_cmd_args_to_value(&cmdargs)?;
         let params = params.combine(&cmdparams);
@@ -3727,16 +3768,16 @@ impl LanguageClient {
         //   (ensure that the mutex is acquired by what starts the group of servers)
         //
         // TODO: May want to lock other methods that update the list of clients.
-        let mutex_for_language_id = self.get_client_update_mutex(Some(languageId.clone()))?;
+        let mutex_for_language_id = self.get_client_update_mutex(Some(language_id.clone()))?;
         let _raii_lock: MutexGuard<()> = mutex_for_language_id.lock().map_err(|err| {
-            format_err!(
+            anyhow!(
                 "Failed to lock client creation for languageId {:?}: {:?}",
-                languageId,
+                language_id,
                 err
             )
         })?;
 
-        if self.get(|state| state.clients.contains_key(&Some(languageId.clone())))? {
+        if self.get(|state| state.clients.contains_key(&Some(language_id.clone())))? {
             return Ok(json!({}));
         }
 
@@ -3744,21 +3785,21 @@ impl LanguageClient {
         info!("settings synced");
 
         let command = self
-            .get(|state| state.serverCommands.get(&languageId).cloned())?
+            .get(|state| state.server_commands.get(&language_id).cloned())?
             .ok_or_else(|| {
                 Error::from(LCError::NoServerCommands {
-                    languageId: languageId.clone(),
+                    language_id: language_id.clone(),
                 })
             })?;
 
-        let rootPath: Option<String> = try_get("rootPath", &params)?;
-        let root = if let Some(r) = rootPath {
+        let root_path: Option<String> = try_get("rootPath", &params)?;
+        let root = if let Some(r) = root_path {
             r
         } else {
-            get_rootPath(
+            get_root_path(
                 Path::new(&filename),
-                &languageId,
-                &self.get(|state| state.rootMarkers.clone())?,
+                &language_id,
+                &self.get(|state| state.root_markers.clone())?,
             )?
             .to_string_lossy()
             .into()
@@ -3769,7 +3810,7 @@ impl LanguageClient {
         }
         info!("{}", message);
         self.update(|state| {
-            state.roots.insert(languageId.clone(), root.clone());
+            state.roots.insert(language_id.clone(), root.clone());
             Ok(())
         })?;
 
@@ -3778,7 +3819,7 @@ impl LanguageClient {
                 let addr = command
                     .get(0)
                     .map(|s| s.replace("tcp://", ""))
-                    .ok_or_else(|| err_msg("Server command can't be empty!"))?;
+                    .ok_or_else(|| anyhow!("Server command can't be empty!"))?;
                 let stream = TcpStream::connect(addr)?;
                 let reader = Box::new(BufReader::new(stream.try_clone()?));
                 let writer = Box::new(BufWriter::new(stream));
@@ -3795,18 +3836,18 @@ impl LanguageClient {
                     })
                     .collect();
 
-                let stderr = match self.get(|state| state.serverStderr.clone())? {
+                let stderr = match self.get(|state| state.server_stderr.clone())? {
                     Some(ref path) => std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
                         .open(path)
-                        .with_context(|err| format!("Failed to open file ({}): {}", path, err))?
+                        .with_context(|| format!("Failed to open file ({})", path))?
                         .into(),
                     None => Stdio::null(),
                 };
 
                 let process = std::process::Command::new(
-                    command.get(0).ok_or_else(|| err_msg("Empty command!"))?,
+                    command.get(0).ok_or_else(|| anyhow!("Empty command!"))?,
                 )
                 .args(&command[1..])
                 .current_dir(&root)
@@ -3814,26 +3855,24 @@ impl LanguageClient {
                 .stdout(Stdio::piped())
                 .stderr(stderr)
                 .spawn()
-                .with_context(|err| {
-                    format!("Failed to start language server ({:?}): {}", command, err)
-                })?;
+                .with_context(|| format!("Failed to start language server ({:?})", command))?;
 
                 let child_id = Some(process.id());
                 let reader = Box::new(BufReader::new(
                     process
                         .stdout
-                        .ok_or_else(|| err_msg("Failed to get subprocess stdout"))?,
+                        .ok_or_else(|| anyhow!("Failed to get subprocess stdout"))?,
                 ));
                 let writer = Box::new(BufWriter::new(
                     process
                         .stdin
-                        .ok_or_else(|| err_msg("Failed to get subprocess stdin"))?,
+                        .ok_or_else(|| anyhow!("Failed to get subprocess stdin"))?,
                 ));
                 (child_id, reader, writer)
             };
 
         let client = RpcClient::new(
-            Some(languageId.clone()),
+            Some(language_id.clone()),
             reader,
             writer,
             child_id,
@@ -3842,11 +3881,11 @@ impl LanguageClient {
         self.update(|state| {
             state
                 .clients
-                .insert(Some(languageId.clone()), Arc::new(client));
+                .insert(Some(language_id.clone()), Arc::new(client));
             Ok(())
         })?;
 
-        info!("End {}", REQUEST__StartServer);
+        info!("End {}", REQUEST_START_SERVER);
 
         if self.get(|state| state.clients.len())? == 2 {
             self.define_signs()?;
@@ -3855,11 +3894,11 @@ impl LanguageClient {
         self.initialize(&params)?;
         self.initialized(&params)?;
 
-        let root = self.get(|state| state.roots.get(&languageId).cloned().unwrap_or_default())?;
+        let root = self.get(|state| state.roots.get(&language_id).cloned().unwrap_or_default())?;
         match self.get_workspace_settings(&root) {
             Ok(Value::Null) => (),
-            Ok(settings) => self.workspace_didChangeConfiguration(&json!({
-                "languageId": languageId,
+            Ok(settings) => self.workspace_did_change_configuration(&json!({
+                "languageId": language_id,
                 "settings": settings,
             }))?,
             Err(err) => warn!("Failed to get workspace settings: {}", err),
@@ -3867,10 +3906,10 @@ impl LanguageClient {
 
         self.vim()?
             .rpcclient
-            .notify("setbufvar", json!([filename, VIM__IsServerRunning, 1]))?;
+            .notify("setbufvar", json!([filename, VIM_IS_SERVER_RUNNING, 1]))?;
 
-        self.textDocument_didOpen(&params)?;
-        self.textDocument_didChange(&params)?;
+        self.text_document_did_open(&params)?;
+        self.text_document_did_change(&params)?;
 
         self.vim()?
             .rpcclient
@@ -3878,18 +3917,18 @@ impl LanguageClient {
         Ok(Value::Null)
     }
 
-    pub fn languageClient_serverExited(&self, params: &Value) -> Fallible<()> {
+    pub fn handle_server_exited(&self, params: &Value) -> Result<()> {
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let message: String = try_get("message", params)?.unwrap_or_default();
 
-        if self.get(|state| state.clients.contains_key(&Some(languageId.clone())))? {
-            if let Err(err) = self.cleanup(&languageId) {
+        if self.get(|state| state.clients.contains_key(&Some(language_id.clone())))? {
+            if let Err(err) = self.cleanup(&language_id) {
                 error!("Error in cleanup: {:?}", err);
             }
             if let Err(err) = self.vim()?.echoerr(format!(
                 "Language server {} exited unexpectedly: {}",
-                languageId, message
+                language_id, message
             )) {
                 error!("Error in echoerr: {:?}", err);
             }
@@ -3898,10 +3937,10 @@ impl LanguageClient {
         Ok(())
     }
 
-    pub fn handle_fs_events(&self) -> Fallible<()> {
+    pub fn handle_fs_events(&self) -> Result<()> {
         let mut pending_changes = HashMap::new();
         self.update(|state| {
-            for (languageId, watcher_rx) in &mut state.watcher_rxs {
+            for (language_id, watcher_rx) in &mut state.watcher_rxs {
                 let mut events = vec![];
                 loop {
                     let result = watcher_rx.try_recv();
@@ -3911,7 +3950,7 @@ impl LanguageClient {
                             break;
                         }
                         Err(mpsc::TryRecvError::Disconnected) => {
-                            bail!("File system notification channel disconnected!");
+                            return Err(anyhow!("File system notification channel disconnected!"));
                         }
                     };
                     events.push(event);
@@ -3928,14 +3967,14 @@ impl LanguageClient {
                     continue;
                 }
 
-                pending_changes.insert(languageId.to_owned(), changes);
+                pending_changes.insert(language_id.to_owned(), changes);
             }
             Ok(())
         })?;
 
-        for (languageId, changes) in pending_changes {
-            self.workspace_didChangeWatchedFiles(&json!({
-                "languageId": languageId,
+        for (language_id, changes) in pending_changes {
+            self.workspace_did_change_watched_files(&json!({
+                "languageId": language_id,
                 "changes": changes
             }))?;
         }
@@ -3943,27 +3982,35 @@ impl LanguageClient {
         Ok(())
     }
 
-    pub fn workspace_didChangeWatchedFiles(&self, params: &Value) -> Fallible<()> {
-        info!("Begin {}", lsp::notification::DidChangeWatchedFiles::METHOD);
+    pub fn workspace_did_change_watched_files(&self, params: &Value) -> Result<()> {
+        info!(
+            "Begin {}",
+            lsp_types::notification::DidChangeWatchedFiles::METHOD
+        );
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
 
-        let params: DidChangeWatchedFilesParams = params.clone().to_lsp()?;
-        self.get_client(&Some(languageId))?
-            .notify(lsp::notification::DidChangeWatchedFiles::METHOD, params)?;
+        let params = DidChangeWatchedFilesParams::deserialize(params)?;
+        self.get_client(&Some(language_id))?.notify(
+            lsp_types::notification::DidChangeWatchedFiles::METHOD,
+            params,
+        )?;
 
-        info!("End {}", lsp::notification::DidChangeWatchedFiles::METHOD);
+        info!(
+            "End {}",
+            lsp_types::notification::DidChangeWatchedFiles::METHOD
+        );
         Ok(())
     }
 
-    pub fn java_classFileContents(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__ClassFileContents);
+    pub fn java_class_file_contents(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_CLASS_FILE_CONTENTS);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
 
         let content: String = self
-            .get_client(&Some(languageId))?
-            .call(REQUEST__ClassFileContents, params)?;
+            .get_client(&Some(language_id))?
+            .call(REQUEST_CLASS_FILE_CONTENTS, params)?;
 
         let lines: Vec<String> = content
             .lines()
@@ -3976,7 +4023,7 @@ impl LanguageClient {
             .unwrap_or_else(|| "edit".to_string());
 
         let uri: String =
-            try_get("uri", params)?.ok_or_else(|| err_msg("uri not found in request!"))?;
+            try_get("uri", params)?.ok_or_else(|| anyhow!("uri not found in request!"))?;
 
         self.vim()?
             .rpcclient
@@ -3986,37 +4033,37 @@ impl LanguageClient {
         self.vim()?
             .command("setlocal buftype=nofile filetype=java noswapfile")?;
 
-        info!("End {}", REQUEST__ClassFileContents);
+        info!("End {}", REQUEST_CLASS_FILE_CONTENTS);
         Ok(Value::String(content))
     }
 
-    pub fn debug_info(&self, params: &Value) -> Fallible<Value> {
-        info!("Begin {}", REQUEST__DebugInfo);
+    pub fn debug_info(&self, params: &Value) -> Result<Value> {
+        info!("Begin {}", REQUEST_DEBUG_INFO);
         let filename = self.vim()?.get_filename(params)?;
-        let languageId = self.vim()?.get_languageId(&filename, params)?;
+        let language_id = self.vim()?.get_language_id(&filename, params)?;
         let mut msg = String::new();
         self.get(|state| {
             msg += &format!(
                 "Project root: {}\n",
-                state.roots.get(&languageId).cloned().unwrap_or_default()
+                state.roots.get(&language_id).cloned().unwrap_or_default()
             );
             msg += &format!(
                 "Language server process id: {:?}\n",
                 state
                     .clients
-                    .get(&Some(languageId.clone()))
+                    .get(&Some(language_id.clone()))
                     .map(|c| c.process_id)
                     .unwrap_or_default(),
             );
             msg += &format!(
                 "Language server stderr: {}\n",
-                state.serverStderr.clone().unwrap_or_default()
+                state.server_stderr.clone().unwrap_or_default()
             );
             msg += &format!("Log level: {}\n", state.logger.level);
             msg += &format!("Log file: {:?}\n", state.logger.path);
         })?;
         self.vim()?.echo(&msg)?;
-        info!("End {}", REQUEST__DebugInfo);
+        info!("End {}", REQUEST_DEBUG_INFO);
         Ok(json!(msg))
     }
 }

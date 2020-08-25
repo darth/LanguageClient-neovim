@@ -1,27 +1,32 @@
-use super::*;
+use crate::types::{RootMarkers, ToUsize};
+use anyhow::{anyhow, Result};
+use log::*;
+use lsp_types::{CodeAction, Position, TextEdit, Url};
+use serde_json::json;
+use serde_json::Value;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    str::FromStr,
+};
 
 pub fn escape_single_quote<S: AsRef<str>>(s: S) -> String {
     s.as_ref().replace("'", "''")
 }
 
-#[test]
-fn test_escape_single_quote() {
-    assert_eq!(escape_single_quote("my' precious"), "my'' precious");
-}
-
-pub fn get_rootPath<'a>(
+pub fn get_root_path<'a>(
     path: &'a Path,
-    languageId: &str,
-    rootMarkers: &Option<RootMarkers>,
-) -> Fallible<&'a Path> {
-    if let Some(ref rootMarkers) = *rootMarkers {
-        let empty = vec![];
-        let rootMarkers = match *rootMarkers {
+    language_id: &str,
+    root_markers: &Option<RootMarkers>,
+) -> Result<&'a Path> {
+    if let Some(ref root_markers) = *root_markers {
+        let empty = &vec![];
+        let root_markers = match *root_markers {
             RootMarkers::Array(ref arr) => arr,
-            RootMarkers::Map(ref map) => map.get(languageId).unwrap_or(&empty),
+            RootMarkers::Map(ref map) => map.get(language_id).unwrap_or(empty),
         };
 
-        for marker in rootMarkers {
+        for marker in root_markers {
             let ret = traverse_up(path, |dir| {
                 let p = dir.join(marker);
                 let p = p.to_str();
@@ -41,7 +46,7 @@ pub fn get_rootPath<'a>(
         }
     }
 
-    match languageId {
+    match language_id {
         "rust" => traverse_up(path, |dir| dir.join("Cargo.toml").exists()),
         "php" => traverse_up(path, |dir| dir.join("composer.json").exists()),
         "javascript" | "typescript" | "javascript.jsx" | "typescript.tsx" => {
@@ -61,10 +66,13 @@ pub fn get_rootPath<'a>(
                 || dir.join("build.gradle").exists()
         }),
         "scala" => traverse_up(path, |dir| dir.join("build.sbt").exists()),
-        "haskell" => traverse_up(path, |dir| dir.join("stack.yaml").exists())
-            .or_else(|_| traverse_up(path, |dir| dir.join(".cabal").exists())),
+        "haskell" => traverse_up(path, |dir| dir.join("stack.yaml").exists()).or_else(|_| {
+            traverse_up(path, |dir| {
+                dir_contains_file(dir, |f| has_extension(f, "cabal"))
+            })
+        }),
         "go" => traverse_up(path, |dir| dir.join("go.mod").exists()),
-        _ => Err(format_err!("Unknown languageId: {}", languageId)),
+        _ => Err(anyhow!("Unknown languageId: {}", language_id)),
     }
     .or_else(|_| {
         traverse_up(path, |dir| {
@@ -74,7 +82,7 @@ pub fn get_rootPath<'a>(
     .or_else(|_| {
         let parent = path
             .parent()
-            .ok_or_else(|| format_err!("Failed to get parent dir! path: {:?}", path));
+            .ok_or_else(|| anyhow!("Failed to get parent dir! path: {:?}", path));
         warn!(
             "Unknown project type. Fallback to use dir as project root: {:?}",
             parent
@@ -83,7 +91,33 @@ pub fn get_rootPath<'a>(
     })
 }
 
-fn traverse_up<F>(path: &Path, predicate: F) -> Fallible<&Path>
+/// If iterating the directory fails (e.g. because it is not a directory), returns false; if a
+/// file cannot be inspected, that file is considered nonexistent.
+fn dir_contains_file<F>(path: &Path, predicate: F) -> bool
+where
+    F: Fn(&Path) -> bool,
+{
+    if let Ok(diriter) = path.read_dir() {
+        for entry in diriter {
+            if let Ok(entry) = entry {
+                if predicate(&entry.path()) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn has_extension(path: &Path, ext: &str) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(path_ext) if path_ext == ext => true,
+        _ => false,
+    }
+}
+
+fn traverse_up<F>(path: &Path, predicate: F) -> Result<&Path>
 where
     F: Fn(&Path) -> bool,
 {
@@ -91,7 +125,7 @@ where
         return Ok(path);
     }
 
-    let next_path = path.parent().ok_or_else(|| err_msg("Hit root"))?;
+    let next_path = path.parent().ok_or_else(|| anyhow!("Hit root"))?;
 
     traverse_up(next_path, predicate)
 }
@@ -120,14 +154,14 @@ fn is_dotnet_root(dir: &Path) -> bool {
 }
 
 pub trait ToUrl {
-    fn to_url(&self) -> Fallible<Url>;
+    fn to_url(&self) -> Result<Url>;
 }
 
 impl<P: AsRef<Path> + std::fmt::Debug> ToUrl for P {
-    fn to_url(&self) -> Fallible<Url> {
+    fn to_url(&self) -> Result<Url> {
         Url::from_file_path(self)
             .or_else(|_| Url::from_str(&self.as_ref().to_string_lossy()))
-            .or_else(|_| Err(format_err!("Failed to convert ({:?}) to Url", self)))
+            .or_else(|_| Err(anyhow!("Failed to convert ({:?}) to Url", self)))
     }
 }
 
@@ -141,31 +175,6 @@ fn position_to_offset(lines: &[String], position: &Position) -> usize {
 
     let chars_above: usize = lines[..line].iter().map(|text| text.len() + 1).sum();
     chars_above + character
-}
-
-#[test]
-fn test_position_to_offset() {
-    assert_eq!(position_to_offset(&[], &Position::new(0, 0)), 0);
-
-    let lines: Vec<String> = "\n".lines().map(ToOwned::to_owned).collect();
-    assert_eq!(position_to_offset(&lines, &Position::new(0, 0)), 0);
-    assert_eq!(position_to_offset(&lines, &Position::new(0, 1)), 0);
-    assert_eq!(position_to_offset(&lines, &Position::new(1, 0)), 0);
-    assert_eq!(position_to_offset(&lines, &Position::new(1, 1)), 0);
-
-    let lines: Vec<String> = "a\n".lines().map(ToOwned::to_owned).collect();
-    assert_eq!(position_to_offset(&lines, &Position::new(0, 0)), 0);
-    assert_eq!(position_to_offset(&lines, &Position::new(0, 1)), 1);
-    assert_eq!(position_to_offset(&lines, &Position::new(0, 2)), 1);
-    assert_eq!(position_to_offset(&lines, &Position::new(1, 0)), 0);
-    assert_eq!(position_to_offset(&lines, &Position::new(1, 1)), 1);
-    assert_eq!(position_to_offset(&lines, &Position::new(1, 2)), 1);
-
-    let lines: Vec<String> = "a\nbc\n".lines().map(ToOwned::to_owned).collect();
-    assert_eq!(position_to_offset(&lines, &Position::new(1, 0)), 2);
-    assert_eq!(position_to_offset(&lines, &Position::new(1, 1)), 3);
-    assert_eq!(position_to_offset(&lines, &Position::new(1, 2)), 4);
-    assert_eq!(position_to_offset(&lines, &Position::new(1, 3)), 4);
 }
 
 fn offset_to_position(lines: &[String], offset: usize) -> Position {
@@ -187,33 +196,11 @@ fn offset_to_position(lines: &[String], offset: usize) -> Position {
     Position::new(last_line as u64, last_character as u64)
 }
 
-#[test]
-fn test_offset_to_position() {
-    assert_eq!(offset_to_position(&[], 0), Position::new(0, 0));
-
-    let lines: Vec<String> = "\n".lines().map(ToOwned::to_owned).collect();
-    assert_eq!(offset_to_position(&lines, 0), Position::new(0, 0));
-    assert_eq!(offset_to_position(&lines, 1), Position::new(0, 0));
-
-    let lines: Vec<String> = "a\n".lines().map(ToOwned::to_owned).collect();
-    assert_eq!(offset_to_position(&lines, 0), Position::new(0, 0));
-    assert_eq!(offset_to_position(&lines, 1), Position::new(0, 1));
-    assert_eq!(offset_to_position(&lines, 2), Position::new(0, 1));
-
-    let lines: Vec<String> = "a\nbc\n".lines().map(ToOwned::to_owned).collect();
-    assert_eq!(offset_to_position(&lines, 0), Position::new(0, 0));
-    assert_eq!(offset_to_position(&lines, 1), Position::new(0, 1));
-    assert_eq!(offset_to_position(&lines, 2), Position::new(1, 0));
-    assert_eq!(offset_to_position(&lines, 3), Position::new(1, 1));
-    assert_eq!(offset_to_position(&lines, 4), Position::new(1, 2));
-    assert_eq!(offset_to_position(&lines, 5), Position::new(1, 2));
-}
-
-pub fn apply_TextEdits(
+pub fn apply_text_edits(
     lines: &[String],
     edits: &[TextEdit],
     position: &Position,
-) -> Fallible<(Vec<String>, Position)> {
+) -> Result<(Vec<String>, Position)> {
     // Edits are ordered from bottom to top, from right to left.
     let mut edits_by_index = vec![];
     for edit in edits {
@@ -262,152 +249,6 @@ pub fn apply_TextEdits(
     );
 
     Ok((new_lines, new_position))
-}
-
-#[test]
-fn test_apply_TextEdit() {
-    let lines: Vec<String> = r#"fn main() {
-0;
-}
-"#
-    .lines()
-    .map(|l| l.to_owned())
-    .collect();
-
-    let expect: Vec<String> = r#"fn main() {
-    0;
-}
-"#
-    .lines()
-    .map(|l| l.to_owned())
-    .collect();
-
-    let edit = TextEdit {
-        range: Range {
-            start: Position {
-                line: 0,
-                character: 0,
-            },
-            end: Position {
-                line: 3,
-                character: 0,
-            },
-        },
-        new_text: r#"fn main() {
-    0;
-}
-"#
-        .to_owned(),
-    };
-
-    let position = Position::new(0, 0);
-
-    // Ignore returned position since the edit's range covers current position and the new position
-    // is undefined in this case
-    let (result, _) = apply_TextEdits(&lines, &[edit], &position).unwrap();
-    assert_eq!(result, expect);
-}
-
-#[test]
-fn test_apply_TextEdit_overlong_end() {
-    let lines: Vec<String> = r#"abc = 123"#.lines().map(|l| l.to_owned()).collect();
-
-    let expect: Vec<String> = r#"nb = 123"#.lines().map(|l| l.to_owned()).collect();
-
-    let edit = TextEdit {
-        range: Range {
-            start: Position {
-                line: 0,
-                character: 0,
-            },
-            end: Position {
-                line: 99999999,
-                character: 0,
-            },
-        },
-        new_text: r#"nb = 123"#.to_owned(),
-    };
-
-    let position = Position::new(0, 1);
-
-    let (result, _) = apply_TextEdits(&lines, &[edit], &position).unwrap();
-    assert_eq!(result, expect);
-}
-
-#[test]
-fn test_apply_TextEdit_position() {
-    let lines: Vec<String> = "abc = 123".lines().map(|l| l.to_owned()).collect();
-
-    let expected_lines: Vec<String> = "newline\nabcde = 123"
-        .lines()
-        .map(|l| l.to_owned())
-        .collect();
-
-    let edits = [
-        TextEdit {
-            range: Range {
-                start: Position {
-                    line: 0,
-                    character: 1,
-                },
-                end: Position {
-                    line: 0,
-                    character: 3,
-                },
-            },
-            new_text: "bcde".to_owned(),
-        },
-        TextEdit {
-            range: Range {
-                start: Position {
-                    line: 0,
-                    character: 0,
-                },
-                end: Position {
-                    line: 0,
-                    character: 0,
-                },
-            },
-            new_text: "newline\n".to_owned(),
-        },
-    ];
-
-    let position = Position::new(0, 4);
-    let expected_position = Position::new(1, 6);
-
-    assert_eq!(
-        apply_TextEdits(&lines, &edits, &position).unwrap(),
-        (expected_lines, expected_position)
-    );
-}
-
-#[test]
-fn test_apply_TextEdit_CRLF() {
-    let lines: Vec<String> = "abc = 123".lines().map(|l| l.to_owned()).collect();
-
-    let expected_lines: Vec<String> = "a\r\nbc = 123".lines().map(|l| l.to_owned()).collect();
-
-    let edit = TextEdit {
-        range: Range {
-            start: Position {
-                line: 0,
-                character: 0,
-            },
-            end: Position {
-                line: 0,
-                character: 1,
-            },
-        },
-        new_text: "a\r\n".to_owned(),
-    };
-
-    let position = Position::new(0, 2);
-    let expected_position = Position::new(1, 1);
-
-    assert_eq!(
-        apply_TextEdits(&lines, &[edit], &position).unwrap(),
-        (expected_lines, expected_position)
-    );
 }
 
 pub trait Combine {
@@ -475,55 +316,22 @@ pub fn expand_json_path(value: Value) -> Value {
     }
 }
 
-#[test]
-fn test_expand_json_path() {
-    assert_eq!(
-        expand_json_path(json!({
-            "k": "v"
-        })),
-        json!({
-            "k": "v"
-        })
-    );
-    assert_eq!(
-        expand_json_path(json!({
-            "rust.rls": true
-        })),
-        json!({
-            "rust": {
-                "rls": true
-            }
-        })
-    );
-}
-
-pub fn vim_cmd_args_to_value(args: &[String]) -> Fallible<Value> {
+pub fn vim_cmd_args_to_value(args: &[String]) -> Result<Value> {
     let mut map = serde_json::map::Map::new();
     for arg in args {
         let mut tokens: Vec<_> = arg.splitn(2, '=').collect();
         tokens.reverse();
-        let key = tokens.pop().ok_or_else(|| {
-            format_err!("Failed to parse command arguments! tokens: {:?}", tokens)
-        })?;
-        let value = tokens.pop().ok_or_else(|| {
-            format_err!("Failed to parse command arguments! tokens: {:?}", tokens)
-        })?;
+        let key = tokens
+            .pop()
+            .ok_or_else(|| anyhow!("Failed to parse command arguments! tokens: {:?}", tokens))?;
+        let value = tokens
+            .pop()
+            .ok_or_else(|| anyhow!("Failed to parse command arguments! tokens: {:?}", tokens))?;
         let value = Value::String(value.to_owned());
         map.insert(key.to_owned(), value);
     }
 
     Ok(Value::Object(map))
-}
-
-#[test]
-fn test_vim_cmd_args_to_value() {
-    let cmdargs = ["rootPath=/tmp".to_owned()];
-    assert_eq!(
-        vim_cmd_args_to_value(&cmdargs).unwrap(),
-        json!({
-            "rootPath": "/tmp"
-        })
-    );
 }
 
 pub fn diff_value<'a>(v1: &'a Value, v2: &'a Value, path: &str) -> HashMap<String, (Value, Value)> {
@@ -561,25 +369,6 @@ pub fn diff_value<'a>(v1: &'a Value, v2: &'a Value, path: &str) -> HashMap<Strin
     diffs
 }
 
-#[test]
-fn test_diff_value() {
-    assert_eq!(diff_value(&json!({}), &json!({}), "state",), hashmap!());
-    assert_eq!(
-        diff_value(
-            &json!({
-                "line": 1,
-            }),
-            &json!({
-                "line": 3,
-            }),
-            "state"
-        ),
-        hashmap! {
-            "state.line".to_owned() => (json!(1), json!(3)),
-        }
-    );
-}
-
 pub trait Canonicalize {
     fn canonicalize(&self) -> String;
 }
@@ -600,8 +389,8 @@ where
     }
 }
 
-pub fn get_default_initializationOptions(languageId: &str) -> Value {
-    match languageId {
+pub fn get_default_initialization_options(language_id: &str) -> Value {
+    match language_id {
         "java" => json!({
             "extendedClientCapabilities": {
                 "classFileContentsSupport": true
@@ -613,22 +402,22 @@ pub fn get_default_initializationOptions(languageId: &str) -> Value {
 
 /// Given a parameter label and its containing signature, return the part before the label, the
 /// label itself, and the part after the label.
-pub fn decode_parameterLabel(
-    parameter_label: &lsp::ParameterLabel,
+pub fn decode_parameter_label(
+    parameter_label: &lsp_types::ParameterLabel,
     signature: &str,
-) -> Fallible<(String, String, String)> {
+) -> Result<(String, String, String)> {
     match *parameter_label {
-        lsp::ParameterLabel::Simple(ref label) => {
+        lsp_types::ParameterLabel::Simple(ref label) => {
             let chunks: Vec<&str> = signature.split(label).collect();
             if chunks.len() != 2 {
-                return Err(err_msg("Parameter is not part of signature"));
+                return Err(anyhow!("Parameter is not part of signature"));
             }
             let begin = chunks[0].to_string();
             let label = label.to_string();
             let end = chunks[1].to_string();
             Ok((begin, label, end))
         }
-        lsp::ParameterLabel::LabelOffsets([start, finish]) => {
+        lsp_types::ParameterLabel::LabelOffsets([start, finish]) => {
             // Offsets are based on a UTF-16 string representation, inclusive start,
             // exclusive finish.
             let start = start.to_usize()?;
@@ -636,15 +425,15 @@ pub fn decode_parameterLabel(
             let utf16: Vec<u16> = signature.encode_utf16().collect();
             let begin = utf16
                 .get(..start)
-                .ok_or_else(|| err_msg("Offset out of range"))?;
+                .ok_or_else(|| anyhow!("Offset out of range"))?;
             let begin = String::from_utf16(begin)?;
             let label = utf16
                 .get(start..finish)
-                .ok_or_else(|| err_msg("Offset out of range"))?;
+                .ok_or_else(|| anyhow!("Offset out of range"))?;
             let label = String::from_utf16(label)?;
             let end = utf16
                 .get(finish..)
-                .ok_or_else(|| err_msg("Offset out of range"))?;
+                .ok_or_else(|| anyhow!("Offset out of range"))?;
             let end = String::from_utf16(end)?;
             Ok((begin, label, end))
         }
@@ -678,11 +467,282 @@ pub fn convert_to_vim_str(s: &str) -> String {
     vs
 }
 
-#[test]
-fn test_convert_to_vim_str() {
-    assert_eq!(convert_to_vim_str("abcdefg"), "'abcdefg'");
-    assert_eq!(convert_to_vim_str("'abcdefg"), "'''abcdefg'");
-    assert_eq!(convert_to_vim_str("'x'x'x'x'"), "'''x''x''x''x'''");
-    assert_eq!(convert_to_vim_str("xyz'''ffff"), "'xyz''''''ffff'");
-    assert_eq!(convert_to_vim_str("'''"), "''''''''");
+/// Converts the kind of a `CodeAction` to a `&str`.
+pub fn code_action_kind_as_str(action: &CodeAction) -> &str {
+    match action.kind.as_ref().map(String::as_ref) {
+        None | Some("") => "action",
+        Some(kind) => kind,
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use lsp_types::Range;
+
+    #[test]
+    fn test_escape_single_quote() {
+        assert_eq!(escape_single_quote("my' precious"), "my'' precious");
+    }
+
+    #[test]
+    fn test_position_to_offset() {
+        assert_eq!(position_to_offset(&[], &Position::new(0, 0)), 0);
+
+        let lines: Vec<String> = "\n".lines().map(ToOwned::to_owned).collect();
+        assert_eq!(position_to_offset(&lines, &Position::new(0, 0)), 0);
+        assert_eq!(position_to_offset(&lines, &Position::new(0, 1)), 0);
+        assert_eq!(position_to_offset(&lines, &Position::new(1, 0)), 0);
+        assert_eq!(position_to_offset(&lines, &Position::new(1, 1)), 0);
+
+        let lines: Vec<String> = "a\n".lines().map(ToOwned::to_owned).collect();
+        assert_eq!(position_to_offset(&lines, &Position::new(0, 0)), 0);
+        assert_eq!(position_to_offset(&lines, &Position::new(0, 1)), 1);
+        assert_eq!(position_to_offset(&lines, &Position::new(0, 2)), 1);
+        assert_eq!(position_to_offset(&lines, &Position::new(1, 0)), 0);
+        assert_eq!(position_to_offset(&lines, &Position::new(1, 1)), 1);
+        assert_eq!(position_to_offset(&lines, &Position::new(1, 2)), 1);
+
+        let lines: Vec<String> = "a\nbc\n".lines().map(ToOwned::to_owned).collect();
+        assert_eq!(position_to_offset(&lines, &Position::new(1, 0)), 2);
+        assert_eq!(position_to_offset(&lines, &Position::new(1, 1)), 3);
+        assert_eq!(position_to_offset(&lines, &Position::new(1, 2)), 4);
+        assert_eq!(position_to_offset(&lines, &Position::new(1, 3)), 4);
+    }
+
+    #[test]
+    fn test_offset_to_position() {
+        assert_eq!(offset_to_position(&[], 0), Position::new(0, 0));
+
+        let lines: Vec<String> = "\n".lines().map(ToOwned::to_owned).collect();
+        assert_eq!(offset_to_position(&lines, 0), Position::new(0, 0));
+        assert_eq!(offset_to_position(&lines, 1), Position::new(0, 0));
+
+        let lines: Vec<String> = "a\n".lines().map(ToOwned::to_owned).collect();
+        assert_eq!(offset_to_position(&lines, 0), Position::new(0, 0));
+        assert_eq!(offset_to_position(&lines, 1), Position::new(0, 1));
+        assert_eq!(offset_to_position(&lines, 2), Position::new(0, 1));
+
+        let lines: Vec<String> = "a\nbc\n".lines().map(ToOwned::to_owned).collect();
+        assert_eq!(offset_to_position(&lines, 0), Position::new(0, 0));
+        assert_eq!(offset_to_position(&lines, 1), Position::new(0, 1));
+        assert_eq!(offset_to_position(&lines, 2), Position::new(1, 0));
+        assert_eq!(offset_to_position(&lines, 3), Position::new(1, 1));
+        assert_eq!(offset_to_position(&lines, 4), Position::new(1, 2));
+        assert_eq!(offset_to_position(&lines, 5), Position::new(1, 2));
+    }
+    #[test]
+    fn test_apply_text_edit() {
+        let lines: Vec<String> = r#"fn main() {
+0;
+}
+"#
+        .lines()
+        .map(|l| l.to_owned())
+        .collect();
+
+        let expect: Vec<String> = r#"fn main() {
+    0;
+}
+"#
+        .lines()
+        .map(|l| l.to_owned())
+        .collect();
+
+        let edit = TextEdit {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 3,
+                    character: 0,
+                },
+            },
+            new_text: r#"fn main() {
+    0;
+}
+"#
+            .to_owned(),
+        };
+
+        let position = Position::new(0, 0);
+
+        // Ignore returned position since the edit's range covers current position and the new position
+        // is undefined in this case
+        let (result, _) = apply_text_edits(&lines, &[edit], &position).unwrap();
+        assert_eq!(result, expect);
+    }
+
+    #[test]
+    fn test_apply_text_edit_overlong_end() {
+        use lsp_types::*;
+
+        let lines: Vec<String> = r#"abc = 123"#.lines().map(|l| l.to_owned()).collect();
+
+        let expect: Vec<String> = r#"nb = 123"#.lines().map(|l| l.to_owned()).collect();
+
+        let edit = TextEdit {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 99999999,
+                    character: 0,
+                },
+            },
+            new_text: r#"nb = 123"#.to_owned(),
+        };
+
+        let position = Position::new(0, 1);
+
+        let (result, _) = apply_text_edits(&lines, &[edit], &position).unwrap();
+        assert_eq!(result, expect);
+    }
+
+    #[test]
+    fn test_apply_text_edit_position() {
+        use lsp_types::*;
+
+        let lines: Vec<String> = "abc = 123".lines().map(|l| l.to_owned()).collect();
+
+        let expected_lines: Vec<String> = "newline\nabcde = 123"
+            .lines()
+            .map(|l| l.to_owned())
+            .collect();
+
+        let edits = [
+            TextEdit {
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 1,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 3,
+                    },
+                },
+                new_text: "bcde".to_owned(),
+            },
+            TextEdit {
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                },
+                new_text: "newline\n".to_owned(),
+            },
+        ];
+
+        let position = Position::new(0, 4);
+        let expected_position = Position::new(1, 6);
+
+        assert_eq!(
+            apply_text_edits(&lines, &edits, &position).unwrap(),
+            (expected_lines, expected_position)
+        );
+    }
+
+    #[test]
+    fn test_apply_text_edit_crlf() {
+        use lsp_types::*;
+
+        let lines: Vec<String> = "abc = 123".lines().map(|l| l.to_owned()).collect();
+
+        let expected_lines: Vec<String> = "a\r\nbc = 123".lines().map(|l| l.to_owned()).collect();
+
+        let edit = TextEdit {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            new_text: "a\r\n".to_owned(),
+        };
+
+        let position = Position::new(0, 2);
+        let expected_position = Position::new(1, 1);
+
+        assert_eq!(
+            apply_text_edits(&lines, &[edit], &position).unwrap(),
+            (expected_lines, expected_position)
+        );
+    }
+
+    #[test]
+    fn test_expand_json_path() {
+        assert_eq!(
+            expand_json_path(json!({
+                "k": "v"
+            })),
+            json!({
+                "k": "v"
+            })
+        );
+        assert_eq!(
+            expand_json_path(json!({
+                "rust.rls": true
+            })),
+            json!({
+                "rust": {
+                    "rls": true
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_vim_cmd_args_to_value() {
+        let cmdargs = ["rootPath=/tmp".to_owned()];
+        assert_eq!(
+            vim_cmd_args_to_value(&cmdargs).unwrap(),
+            json!({
+                "rootPath": "/tmp"
+            })
+        );
+    }
+
+    #[test]
+    fn test_diff_value() {
+        use maplit::hashmap;
+
+        assert_eq!(diff_value(&json!({}), &json!({}), "state",), hashmap!());
+        assert_eq!(
+            diff_value(
+                &json!({
+                    "line": 1,
+                }),
+                &json!({
+                    "line": 3,
+                }),
+                "state"
+            ),
+            hashmap! {
+                "state.line".to_owned() => (json!(1), json!(3)),
+            }
+        );
+    }
+
+    #[test]
+    fn test_convert_to_vim_str() {
+        assert_eq!(convert_to_vim_str("abcdefg"), "'abcdefg'");
+        assert_eq!(convert_to_vim_str("'abcdefg"), "'''abcdefg'");
+        assert_eq!(convert_to_vim_str("'x'x'x'x'"), "'''x''x''x''x'''");
+        assert_eq!(convert_to_vim_str("xyz'''ffff"), "'xyz''''''ffff'");
+        assert_eq!(convert_to_vim_str("'''"), "''''''''");
+    }
 }

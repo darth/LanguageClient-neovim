@@ -117,6 +117,14 @@ function! s:hasSnippetSupport() abort
     return 0
 endfunction
 
+function! s:getSelectionUI() abort
+	if type(get(g:, 'LanguageClient_selectionUI', v:null)) is s:TYPE.funcref
+		return 'funcref'
+	else
+		return get(g:, 'LanguageClient_selectionUI', v:null)
+	endif
+endfunction
+
 function! s:useVirtualText() abort
     let l:use = s:GetVar('LanguageClient_useVirtualText')
     if l:use isnot v:null
@@ -199,6 +207,18 @@ function! s:inputlist(...) abort
     let l:selection = inputlist(a:000)
     call inputrestore()
     return l:selection
+endfunction
+
+function! s:selectionUI_funcref(source, sink) abort
+    if type(get(g:, 'LanguageClient_selectionUI')) is s:TYPE.funcref
+        call call(g:LanguageClient_selectionUI, [a:source, function(a:sink)])
+    elseif get(g:, 'LanguageClient_selectionUI', 'FZF') ==? 'FZF'
+                \ && get(g:, 'loaded_fzf')
+        call s:FZF(a:source, a:sink)
+    else
+        call s:Echoerr('Unsupported selection UI, use "FZF" or a funcref')
+        return
+    endif
 endfunction
 
 function! s:FZF(source, sink) abort
@@ -429,6 +449,7 @@ function! s:OpenHoverPreview(bufname, lines, filetype) abort
         \   'col': col,
         \   'width': width,
         \   'height': height,
+        \   'style': s:GetVar('LanguageClient_floatingWindowStyle', 'minimal'),
         \ })
 
         execute 'noswapfile edit!' a:bufname
@@ -880,16 +901,25 @@ function! LanguageClient#textDocument_codeLens(...) abort
     return LanguageClient#Call('textDocument/codeLens', l:params, l:Callback)
 endfunction
 
-function! LanguageClient#textDocument_codeAction(...) abort
-    let l:Callback = get(a:000, 1, v:null)
+function! s:do_codeAction(mode, ...) abort
+    let l:Callback = get(a:000, 2, v:null)
     let l:params = {
                 \ 'filename': LSP#filename(),
                 \ 'line': LSP#line(),
                 \ 'character': LSP#character(),
                 \ 'handle': s:IsFalse(l:Callback),
+                \ 'range': LSP#range(a:mode),
                 \ }
-    call extend(l:params, get(a:000, 0, {}))
+    call extend(l:params, get(a:000, 1, {}))
     return LanguageClient#Call('textDocument/codeAction', l:params, l:Callback)
+endfunction
+
+function! LanguageClient#textDocument_visualCodeAction(...) range abort
+  call s:do_codeAction('v', a:000)
+endfunction
+
+function! LanguageClient#textDocument_codeAction(...) abort
+  call s:do_codeAction('n', a:000)
 endfunction
 
 function! LanguageClient#textDocument_completion(...) abort
@@ -1419,12 +1449,15 @@ endfunction
 
 function! LanguageClient_contextMenu() abort
     let l:options = keys(LanguageClient_contextMenuItems())
-
-    if get(g:, 'loaded_fzf') && get(g:, 'LanguageClient_fzfContextMenu', 1)
-        return fzf#run(fzf#wrap({
-                    \ 'source': l:options,
-                    \ 'sink': function('LanguageClient_handleContextMenuItem'),
-                    \ }))
+    let l:useSelectionUI = get(g:, 'LanguageClient_selectionUIContextMenu',
+				\ get(g:, 'LanguageClient_fzfContextMenu', 1))
+    if l:useSelectionUI
+            \ && (type(get(g:, 'LanguageClient_selectionUI', v:null)) is s:TYPE.funcref
+                \ || (get(g:, 'LanguageClient_selectionUI', v:null) ==? 'FZF'
+                    \ && get(g:, 'loaded_fzf')
+                \ )
+            \ )
+        return s:selectionUI_funcref(l:options, function('LanguageClient_handleContextMenuItem'))
     endif
 
     let l:selections = map(copy(l:options), { key, val -> printf('%d) %s', key + 1, val ) })
