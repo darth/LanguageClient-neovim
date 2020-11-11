@@ -36,14 +36,20 @@ like to map these functions to shortcuts, for example: >
     nnoremap <silent> gd :call LanguageClient#textDocument_definition()<CR>
     nnoremap <silent> <F2> :call LanguageClient#textDocument_rename()<CR>
 
+You can also use slightly cleaner Plug mappings instead of the full function name: >
+
+    nmap <silent> K <Plug>(lcn-hover)
+    nmap <silent> gd <Plug>(lcn-definition)
+    nmap <silent> <F2> <Plug>(lcn-rename)
+
 You can apply these mappings only for buffers with supported filetypes with a
 simple function: >
 
     function LC_maps()
       if has_key(g:LanguageClient_serverCommands, &filetype)
-        nnoremap <buffer> <silent> K :call LanguageClient#textDocument_hover()<cr>
-        nnoremap <buffer> <silent> gd :call LanguageClient#textDocument_definition()<CR>
-        nnoremap <buffer> <silent> <F2> :call LanguageClient#textDocument_rename()<CR>
+        nmap <buffer> <silent> K <Plug>(lcn-hover)
+        nmap <buffer> <silent> gd <Plug>(lcn-definition)
+        nmap <buffer> <silent> <F2> <Plug>(lcn-rename)
       endif
     endfunction
 
@@ -375,7 +381,7 @@ When the value is set to 1, |LanguageClient#textDocument_hover()| opens
 documentation in a floating window instead of preview.
 This variable is effective only when the floating window feature is
 supported. Check by running >
-    :echomsg exists('nvim_open_win')
+    :echomsg exists('*nvim_open_win')
 
 Default: 1 when a floating window is supported, otherwise 0
 Valid Options: 1 | 0
@@ -414,7 +420,14 @@ Maximum severity to show diagnostic messages.
 Default: "Hint"
 Valid options: "Error" | "Warning" | "Information" | "Hint"
 
-2.31 g:LanguageClient_echoProjectRoot  *g:LanguageClient_echoProjectRoot*
+2.31 g:LanguageClient_diagnosticsIgnoreSources  *g:LanguageClient_diagnosticsIgnoreSources*
+
+Does not show the diagnostics message which has the source specified by this
+options.
+
+Default: "[]"
+
+2.32 g:LanguageClient_echoProjectRoot  *g:LanguageClient_echoProjectRoot*
 
 Whether to echo messages in vim of the form: "Project root: /home/user/myproject" when
 the root of a project is detected using g:LanguageClient_rootMarkers.
@@ -422,7 +435,7 @@ the root of a project is detected using g:LanguageClient_rootMarkers.
 Default: 1 to display the messages
 Valid options: 1 | 0
 
-2.32 g:LanguageClient_semanticHighlightMaps   *g:LanguageClient_semanticHighlightMaps*
+2.33 g:LanguageClient_semanticHighlightMaps   *g:LanguageClient_semanticHighlightMaps*
 
 String to list/map map. Defines the mapping of semantic highlighting "scopes" to
 highlight groups. This depends on the LSP server supporting the proposed
@@ -523,14 +536,14 @@ Example configuration for eclipse.jdt.ls:
      highlight! JavaMemberVariable ctermfg=White cterm=italic guifg=White gui=italic
 
 
-2.33 g:LanguageClient_applyCompletionAdditionalTextEdits *g:LanguageClient_applyCompletionAdditionalTextEdits*
+2.34 g:LanguageClient_applyCompletionAdditionalTextEdits *g:LanguageClient_applyCompletionAdditionalTextEdits*
 
 Indicates whether completionItem additional text edits should be applied.
 
 Default: 1
 Valid options: 1 | 0
 
-2.34 g:LanguageClient_preferredMarkupKind *g:LanguageClient_preferredMarkupKind*
+2.35 g:LanguageClient_preferredMarkupKind *g:LanguageClient_preferredMarkupKind*
 
 Sets the preferred markup kind. This value is sent to the server and is
 normally used to decide whether to send plaintext or markdown in things like
@@ -556,25 +569,93 @@ Example setting 3. Set the preferred markup kind to `markdown`
 
   ```
   let g:LanguageClient_preferredMarkupKind: ['markdown']
+  ```
 
-This setting may have no effect of the server decides not to honour it.
+This setting may have no effect if the server decides not to honour it.
 
 Default: v:null
 Valid options: Array<String>
 
-2.35 g:LanguageClient_floatingWindowStyle  *g:LanguageClient_floatingWindowStyle*
+2.36 g:LanguageClient_floatingWindowStyle  *g:LanguageClient_floatingWindowStyle*
 
 Style of opened Neovim floating window.
 
 Default: 'minimal'
 Valid options: 'minimal'
 
-2.36 g:LanguageClient_hideVirtualTextsOnInsert *g:LanguageClient_hideVirtualTextsOnInsert*
+2.37 g:LanguageClient_hideVirtualTextsOnInsert *g:LanguageClient_hideVirtualTextsOnInsert*
 
 Hides all virtual texts for the current buffer while editing in insert mode.
 
 Default: 0
 Valid options: 1 | 0
+
+2.38 g:LanguageClient_setOmnifunc                *g:LanguageClient_setOmnifunc*
+
+Whether set buffer omnifunc to 'LanguageClient#complete'.
+
+Default: v:true
+Valid options: v:true | v:false
+
+2.39 g:LanguageClient_binaryPath                  *g:LanguageClient_binaryPath*
+
+Full path to languageclient binary.
+
+Default: 'bin/languageclient' relative to plugin root.
+Valid options: String
+
+2.40 g:LanguageClient_enableExtensions          *g:LanguageClient_enableExtensions*
+
+LanguageClient-neovim provides extensions for some language servers, such as gopls or rust-analyzer.
+These extensions can be turned on or off, and they are configurable per language (not per language
+server).
+
+An example of the extensions provided is running Rust or Go tests in a vim terminal. This takes
+advantage of the commands provided by rust-analyzer or gopls (respectively) and executes those
+commands in a vim terminal.
+
+Example config:
+  ```
+  let g:LanguageClient_enableExtensions = {
+    \ 'go': v:false,
+    \ 'rust': v:true,
+    \ }
+  ```
+In this example we explicitly disable extensions for the filetype `go`, and enable them for `rust`.
+Filetypes not included in this config will also have their extensions disabled, unless you
+explicitly enable them like we did for `rust`.
+
+The default value for this config, or the absence of this config, enables extensions for all filetypes.
+
+Default: v:null
+
+2.41 g:LanguageClient_codeLensHighlightGroup          *g:LanguageClient_codeLensHighlightGroup*
+
+Highlight group to be used for code lens.
+
+Default: 'Comment'
+
+2.42 g:LanguageClient_hoverMarginSize        *g:LanguageClient_hoverMarginSize*
+
+When using floating windows to open hover previews (for more information see
+|g:LanguageClient_useFloatingHover|), this setting controls whether and how
+big of a margin to draw around the contents of the hover.
+
+Having some margin looks nice, so the default is 1.
+
+Floating windows don't have a true way to set padding/margin on them, so the
+strategy used is to add one line above and below the language server's raw
+hover response, and one space character before the start of every non-empty
+line in the hover response.
+
+Having a space in front of the hover content can cause some syntax
+highlighters to mess up (because e.g., they have a regex expecting a syntax
+construct to be anchored to the start of a line). To turn off adding this
+margin, set this setting to 0. Example:
+>
+  let g:LanguageClient_hoverMarginSize = 0
+<
+Default: 1
 
 ==============================================================================
 3. Commands                                           *LanguageClientCommands*
@@ -905,6 +986,21 @@ Signature: LanguageClient#debugInfo(...)
 
 Print out debug info.
 
+*LanguageClient#diagnosticsNext*
+Signature: LanguageClient#diagnosticsNext()
+
+Moves the cursor to the next diagnostic in the buffer, relative to the current cursor position.
+
+*LanguageClient#diagnosticsPrevious*
+Signature: LanguageClient#diagnosticsPrevious()
+
+Moves the cursor to the previous diagnostic in the buffer, relative to the current cursor position.
+
+*LanguageClient#textDocument_switchSourceHeader*
+Signature: LanguageClient#textDocument_switchSourceHeader(...)
+
+Calls clangd's `textDocument/switchSourceHeader` extension request.
+
 ==============================================================================
 5. Mappings                                           *LanguageClientMappings*
 
@@ -958,6 +1054,12 @@ Calls LanguageClient_textDocument_formatting.
 
 *(lcn-format-sync)*
 Calls LanguageClient_textDocument_formatting_sync.
+
+*(lcn-diagnostics-next)*
+Calls LanguageClient_diagnosticsNext.
+
+*(lcn-diagnostics-prev)*
+Calls LanguageClient_diagnosticsPrevious.
 
 
 ==============================================================================

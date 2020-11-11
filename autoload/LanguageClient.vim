@@ -401,14 +401,14 @@ function! s:OpenHoverPreview(bufname, lines, filetype) abort
         call s:CloseFloatingHover()
 
         let pos = getpos('.')
-
+        let l:hoverMarginSize = s:GetVar('LanguageClient_hoverMarginSize', 1)
         " Calculate width and height and give margin to lines
         let width = 0
         for index in range(len(lines))
             let line = lines[index]
             if line !=# ''
                 " Give a left margin
-                let line = ' ' . line
+                let line = repeat(' ', l:hoverMarginSize) . line
             endif
             let lw = strdisplaywidth(line)
             if lw > width
@@ -418,8 +418,9 @@ function! s:OpenHoverPreview(bufname, lines, filetype) abort
         endfor
 
         " Give margin
-        let width += 1
-        let lines = [''] + lines + ['']
+        let width += l:hoverMarginSize
+        let l:topBottom = repeat([''], l:hoverMarginSize)
+        let lines = l:topBottom + lines + l:topBottom
         let height = len(lines)
 
         " Calculate anchor
@@ -650,6 +651,11 @@ endfunction
 
 let s:root = expand('<sfile>:p:h:h')
 function! LanguageClient#binaryPath() abort
+    let l:path = s:GetVar('LanguageClient_binaryPath')
+    if l:path isnot v:null
+        return l:path
+    endif
+
     let l:filename = 'languageclient'
     if has('win32')
         let l:filename .= '.exe'
@@ -810,6 +816,15 @@ function! LanguageClient#findLocations(...) abort
                 \ }
     call extend(l:params, get(a:000, 0, {}))
     return LanguageClient#Call('languageClient/findLocations', l:params, l:Callback)
+endfunction
+
+function! LanguageClient#textDocument_switchSourceHeader(...) abort
+    let l:Callback = get(a:000, 1, v:null)
+    let l:params = {
+                \ 'filename': LSP#filename(),
+                \ }
+    call extend(l:params, get(a:000, 0, {}))
+    return LanguageClient#Call('textDocument/switchSourceHeader', l:params, l:Callback)
 endfunction
 
 function! LanguageClient#textDocument_definition(...) abort
@@ -1057,6 +1072,22 @@ function! LanguageClient#setLoggingLevel(level) abort
                 \ 'loggingLevel': a:level,
                 \ }
     return LanguageClient#Call('languageClient/setLoggingLevel', l:params, v:null)
+endfunction
+
+function! LanguageClient#diagnosticsPrevious() abort
+    let l:params = {
+                \ 'filename': LSP#filename(),
+                \ 'position': LSP#position(),
+                \ }
+    return LanguageClient#Notify('languageClient/diagnosticsPrevious', l:params)
+endfunction
+
+function! LanguageClient#diagnosticsNext() abort
+    let l:params = {
+                \ 'filename': LSP#filename(),
+                \ 'position': LSP#position(),
+                \ }
+    return LanguageClient#Notify('languageClient/diagnosticsNext', l:params)
 endfunction
 
 function! LanguageClient#setDiagnosticsList(diagnosticsList) abort

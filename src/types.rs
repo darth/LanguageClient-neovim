@@ -5,6 +5,7 @@ use crate::{
     language_client::LanguageClient,
     utils::{code_action_kind_as_str, ToUrl},
     vim::Vim,
+    watcher::FSWatch,
 };
 use anyhow::{anyhow, Result};
 use jsonrpc_core::Params;
@@ -12,8 +13,8 @@ use log::*;
 use lsp_types::{
     CodeAction, CodeLens, Command, CompletionItem, CompletionTextEdit, Diagnostic,
     DiagnosticSeverity, DocumentHighlightKind, FileChangeType, FileEvent, Hover, HoverContents,
-    InsertTextFormat, Location, MarkedString, MarkupContent, MarkupKind, MessageType,
-    NumberOrString, Registration, SemanticHighlightingInformation, SymbolInformation,
+    InitializeResult, InsertTextFormat, Location, MarkedString, MarkupContent, MarkupKind,
+    MessageType, NumberOrString, Registration, SemanticHighlightingInformation, SymbolInformation,
     TextDocumentItem, TextDocumentPositionParams, TraceOption, Url, WorkspaceEdit,
 };
 use maplit::hashmap;
@@ -81,6 +82,8 @@ pub const NOTIFICATION_RUST_DIAGNOSTICS_BEGIN: &str = "rustDocument/diagnosticsB
 pub const NOTIFICATION_RUST_DIAGNOSTICS_END: &str = "rustDocument/diagnosticsEnd";
 pub const NOTIFICATION_WINDOW_PROGRESS: &str = "window/progress";
 pub const NOTIFICATION_LANGUAGE_STATUS: &str = "language/status";
+pub const NOTIFICATION_DIAGNOSTICS_NEXT: &str = "languageClient/diagnosticsNext";
+pub const NOTIFICATION_DIAGNOSTICS_PREVIOUS: &str = "languageClient/diagnosticsPrevious";
 
 pub const VIM_SERVER_STATUS: &str = "g:LanguageClient_serverStatus";
 pub const VIM_SERVER_STATUS_MESSAGE: &str = "g:LanguageClient_serverStatusMessage";
@@ -143,7 +146,7 @@ pub struct State {
     #[serde(skip_serializing)]
     pub vim: Vim,
 
-    pub capabilities: HashMap<String, Value>,
+    pub capabilities: HashMap<String, InitializeResult>,
     pub registrations: Vec<Registration>,
     pub roots: HashMap<String, String>,
     pub text_documents: HashMap<String, TextDocumentItem>,
@@ -156,6 +159,7 @@ pub struct State {
     pub diagnostics: HashMap<String, Vec<Diagnostic>>,
     // filename => codeLens.
     pub code_lens: HashMap<String, Vec<CodeLens>>,
+    pub code_lens_hl_group: String,
     #[serde(skip_serializing)]
     pub line_diagnostics: HashMap<(String, u64), String>,
     /// Active signs.
@@ -169,7 +173,7 @@ pub struct State {
     pub document_highlight_source: Option<HighlightSource>,
     pub user_handlers: HashMap<String, String>,
     #[serde(skip_serializing)]
-    pub watchers: HashMap<String, notify::RecommendedWatcher>,
+    pub watchers: HashMap<String, FSWatch>,
     #[serde(skip_serializing)]
     pub watcher_rxs: HashMap<String, mpsc::Receiver<notify::DebouncedEvent>>,
 
@@ -192,6 +196,7 @@ pub struct State {
     pub diagnostics_display: HashMap<u64, DiagnosticsDisplay>,
     pub diagnostics_signs_max: Option<usize>,
     pub diagnostics_max_severity: DiagnosticSeverity,
+    pub diagnostics_ignore_sources: Vec<String>,
     pub document_highlight_display: HashMap<u64, DocumentHighlightDisplay>,
     pub window_log_message_level: MessageType,
     pub settings_path: Vec<String>,
@@ -205,6 +210,7 @@ pub struct State {
     pub use_virtual_text: UseVirtualText,
     pub hide_virtual_texts_on_insert: bool,
     pub echo_project_root: bool,
+    pub enable_extensions: Option<HashMap<String, bool>>,
 
     pub server_stderr: Option<String>,
     pub logger: Logger,
@@ -272,6 +278,7 @@ impl State {
             diagnostics_display: DiagnosticsDisplay::default(),
             diagnostics_signs_max: None,
             diagnostics_max_severity: DiagnosticSeverity::Hint,
+            diagnostics_ignore_sources: vec![],
             document_highlight_display: DocumentHighlightDisplay::default(),
             window_log_message_level: MessageType::Warning,
             settings_path: vec![format!(".vim{}settings.json", std::path::MAIN_SEPARATOR)],
@@ -287,6 +294,8 @@ impl State {
             echo_project_root: true,
             server_stderr: None,
             preferred_markup_kind: None,
+            enable_extensions: None,
+            code_lens_hl_group: "Comment".into(),
 
             logger,
         })

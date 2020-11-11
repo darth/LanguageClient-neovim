@@ -1,4 +1,4 @@
-use crate::extensions::{java, rust_analyzer};
+use crate::extensions::java;
 use crate::language_client::LanguageClient;
 use crate::vim::{try_get, Mode};
 use crate::{
@@ -10,29 +10,31 @@ use crate::{
         vim_cmd_args_to_value, Canonicalize, Combine, ToUrl,
     },
     viewport,
+    watcher::FSWatch,
 };
 use anyhow::{anyhow, Context, Error, Result};
+use glob::glob;
 use itertools::Itertools;
 use jsonrpc_core::Value;
 use log::{debug, error, info, warn};
-use lsp_types::notification::Notification;
 use lsp_types::request::Request;
+use lsp_types::{notification::Notification, PublishDiagnosticsClientCapabilities};
 use lsp_types::{
-    code_action_kind, ApplyWorkspaceEditParams, ApplyWorkspaceEditResponse, ClientCapabilities,
-    ClientInfo, CodeAction, CodeActionCapability, CodeActionContext, CodeActionKindLiteralSupport,
-    CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams, CodeActionResponse, CodeLens,
-    Command, CompletionCapability, CompletionItem, CompletionItemCapability, CompletionResponse,
-    CompletionTextEdit, Diagnostic, DiagnosticSeverity, DidChangeConfigurationParams,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentChangeOperation, DocumentChanges,
-    DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind,
-    DocumentRangeFormattingParams, DocumentSymbolParams, ExecuteCommandParams, FormattingOptions,
-    GenericCapability, GotoCapability, GotoDefinitionResponse, Hover, HoverCapability,
-    InitializeParams, InitializeResult, InitializedParams, Location, LogMessageParams, MarkupKind,
-    MessageType, NumberOrString, ParameterInformation, ParameterInformationSettings,
-    PartialResultParams, Position, ProgressParams, ProgressParamsValue,
-    PublishDiagnosticsCapability, PublishDiagnosticsParams, Range, ReferenceContext,
+    ApplyWorkspaceEditParams, ApplyWorkspaceEditResponse, ClientCapabilities, ClientInfo,
+    CodeAction, CodeActionCapability, CodeActionContext, CodeActionKind,
+    CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams,
+    CodeActionResponse, CodeLens, Command, CompletionCapability, CompletionItem,
+    CompletionItemCapability, CompletionResponse, CompletionTextEdit, Diagnostic,
+    DiagnosticSeverity, DidChangeConfigurationParams, DidChangeTextDocumentParams,
+    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentChangeOperation, DocumentChanges, DocumentFormattingParams, DocumentHighlight,
+    DocumentHighlightKind, DocumentRangeFormattingParams, DocumentSymbolParams,
+    ExecuteCommandParams, FormattingOptions, GenericCapability, GotoCapability,
+    GotoDefinitionResponse, Hover, HoverCapability, InitializeParams, InitializeResult,
+    InitializedParams, Location, LogMessageParams, MarkupKind, MessageType, NumberOrString,
+    ParameterInformation, ParameterInformationSettings, PartialResultParams, Position,
+    ProgressParams, ProgressParamsValue, PublishDiagnosticsParams, Range, ReferenceContext,
     RegistrationParams, RenameParams, ResourceOp, SemanticHighlightingClientCapability,
     SemanticHighlightingParams, ShowMessageParams, ShowMessageRequestParams, SignatureHelp,
     SignatureHelpCapability, SignatureInformationSettings, SymbolInformation,
@@ -42,7 +44,6 @@ use lsp_types::{
     WorkspaceClientCapabilities, WorkspaceEdit, WorkspaceSymbolParams,
 };
 use maplit::hashmap;
-use notify::Watcher;
 use serde::de::Deserialize;
 use serde_json::json;
 use std::{
@@ -57,6 +58,12 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[derive(PartialEq)]
+pub enum Direction {
+    Next,
+    Previous,
+}
 
 impl LanguageClient {
     pub fn get_client(&self, language_id: &LanguageId) -> Result<Arc<RpcClient>> {
@@ -160,6 +167,7 @@ impl LanguageClient {
         let (
             diagnostics_signs_max,
             diagnostics_max_severity,
+            diagnostics_ignore_sources,
             document_highlight_display,
             selection_ui_auto_open,
             use_virtual_text,
@@ -169,9 +177,12 @@ impl LanguageClient {
             apply_completion_text_edits,
             preferred_markup_kind,
             hide_virtual_texts_on_insert,
+            enable_extensions,
+            code_lens_hl_group,
         ): (
             Option<usize>,
             String,
+            Vec<String>,
             Value,
             u8,
             UseVirtualText,
@@ -181,10 +192,13 @@ impl LanguageClient {
             u8,
             Option<Vec<MarkupKind>>,
             u8,
+            Option<HashMap<String, bool>>,
+            String,
         ) = self.vim()?.eval(
             [
                 "get(g:, 'LanguageClient_diagnosticsSignsMax', v:null)",
                 "get(g:, 'LanguageClient_diagnosticsMaxSeverity', 'Hint')",
+                "get(g:, 'LanguageClient_diagnosticsIgnoreSources', [])",
                 "get(g:, 'LanguageClient_documentHighlightDisplay', {})",
                 "!!s:GetVar('LanguageClient_selectionUI_autoOpen', 1)",
                 "s:useVirtualText()",
@@ -194,6 +208,8 @@ impl LanguageClient {
                 "get(g:, 'LanguageClient_applyCompletionAdditionalTextEdits', 1)",
                 "get(g:, 'LanguageClient_preferredMarkupKind', v:null)",
                 "s:GetVar('LanguageClient_hideVirtualTextsOnInsert', 0)",
+                "get(g:, 'LanguageClient_enableExtensions', v:null)",
+                "get(g:, 'LanguageClient_codeLensHighlightGroup', 'Comment')",
             ]
             .as_ref(),
         )?;
@@ -290,6 +306,7 @@ impl LanguageClient {
             )?;
             state.diagnostics_signs_max = diagnostics_signs_max;
             state.diagnostics_max_severity = diagnostics_max_severity;
+            state.diagnostics_ignore_sources = diagnostics_ignore_sources;
             state.document_highlight_display = serde_json::from_value(
                 serde_json::to_value(&state.document_highlight_display)?
                     .combine(&document_highlight_display),
@@ -309,6 +326,8 @@ impl LanguageClient {
             state.server_stderr = server_stderr;
             state.is_nvim = is_nvim;
             state.preferred_markup_kind = preferred_markup_kind;
+            state.enable_extensions = enable_extensions;
+            state.code_lens_hl_group = code_lens_hl_group;
             Ok(())
         })?;
 
@@ -601,6 +620,45 @@ impl LanguageClient {
         self.vim()?.rpcclient.notify("setline", json!([1, lines]))?;
         debug!("End apply TextEdits");
         Ok(position)
+    }
+
+    // moves the cursor to the next or previous diagnostic, depending on the value of direction.
+    pub fn cycle_diagnostics(&self, params: &Value, direction: Direction) -> Result<()> {
+        let filename = self.vim()?.get_filename(params)?;
+        let pos = self.vim()?.get_position(params)?;
+        let mut diagnostics = self.get(|state| state.diagnostics.clone())?;
+        if let Some(diagnostics) = diagnostics.get_mut(&filename) {
+            if direction == Direction::Next {
+                diagnostics.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
+            } else {
+                diagnostics.sort_by_key(|edit| {
+                    (
+                        -(edit.range.start.line as i64),
+                        -(edit.range.start.character as i64),
+                    )
+                });
+            }
+
+            let (line, col) = (pos.line, pos.character);
+            if let Some((_, diagnostic)) = diagnostics.iter_mut().find_position(|it| {
+                let start = it.range.start;
+                if direction == Direction::Next {
+                    start.line > line || (start.line == line && start.character > col)
+                } else {
+                    start.line < line || (start.line == line && start.character < col)
+                }
+            }) {
+                let line = diagnostic.range.start.line + 1;
+                let col = diagnostic.range.start.character + 1;
+                let _: String = self.vim()?.rpcclient.call("cursor", json!([line, col]))?;
+            } else {
+                self.vim()?.echomsg("No diagnostics found")?;
+            }
+        } else {
+            self.vim()?.echomsg("No diagnostics found")?;
+        }
+
+        Ok(())
     }
 
     fn update_quickfixlist(&self) -> Result<()> {
@@ -967,15 +1025,32 @@ impl LanguageClient {
     }
 
     fn try_handle_command_by_client(&self, cmd: &Command) -> Result<bool> {
-        match cmd.command.as_str() {
-            java::command::APPLY_WORKSPACE_EDIT => self.handle_java_command(cmd),
-            rust_analyzer::command::RUN
-            | rust_analyzer::command::RUN_SINGLE
-            | rust_analyzer::command::SHOW_REFERENCES
-            | rust_analyzer::command::SELECT_APPLY_SOURCE_CHANGE
-            | rust_analyzer::command::APPLY_SOURCE_CHANGE => self.handle_rust_analyzer_command(cmd),
+        let filetype: String = self.vim()?.eval("&filetype")?;
+        let enabled_extensions = self.get(|state| state.enable_extensions.clone())?;
+        if !enabled_extensions
+            .unwrap_or_default()
+            .get(&filetype)
+            .cloned()
+            .unwrap_or(true)
+        {
+            return Ok(false);
+        }
 
-            _ => Ok(false),
+        let capabilities = self.get(|state| state.capabilities.get(&filetype).cloned())?;
+        let server_name = capabilities
+            .unwrap_or_default()
+            .server_info
+            .unwrap_or_default()
+            .name;
+
+        match server_name.as_str() {
+            "gopls" => self.handle_gopls_command(cmd),
+            "rust-analyzer" => self.handle_rust_analyzer_command(cmd),
+            _ => match cmd.command.as_str() {
+                // not sure which name java's language server advertises
+                java::command::APPLY_WORKSPACE_EDIT => self.handle_java_command(cmd),
+                _ => Ok(false),
+            },
         }
     }
 
@@ -1125,16 +1200,16 @@ impl LanguageClient {
                             code_action_literal_support: Some(CodeActionLiteralSupport {
                                 code_action_kind: CodeActionKindLiteralSupport {
                                     value_set: [
-                                        code_action_kind::QUICKFIX,
-                                        code_action_kind::REFACTOR,
-                                        code_action_kind::REFACTOR_EXTRACT,
-                                        code_action_kind::REFACTOR_INLINE,
-                                        code_action_kind::REFACTOR_REWRITE,
-                                        code_action_kind::SOURCE,
-                                        code_action_kind::SOURCE_ORGANIZE_IMPORTS,
+                                        CodeActionKind::QUICKFIX,
+                                        CodeActionKind::REFACTOR,
+                                        CodeActionKind::REFACTOR_EXTRACT,
+                                        CodeActionKind::REFACTOR_INLINE,
+                                        CodeActionKind::REFACTOR_REWRITE,
+                                        CodeActionKind::SOURCE,
+                                        CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
                                     ]
                                     .iter()
-                                    .map(|x| x.to_string())
+                                    .map(|kind| kind.as_str().to_owned())
                                     .collect(),
                                 },
                             }),
@@ -1142,6 +1217,7 @@ impl LanguageClient {
                         }),
                         signature_help: Some(SignatureHelpCapability {
                             signature_information: Some(SignatureInformationSettings {
+                                active_parameter_support: None,
                                 documentation_format: preferred_markup_kind.clone(),
                                 parameter_information: Some(ParameterInformationSettings {
                                     label_offset_support: Some(true),
@@ -1165,9 +1241,9 @@ impl LanguageClient {
                             link_support: Some(true),
                             ..GotoCapability::default()
                         }),
-                        publish_diagnostics: Some(PublishDiagnosticsCapability {
+                        publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                             related_information: Some(true),
-                            ..PublishDiagnosticsCapability::default()
+                            ..PublishDiagnosticsClientCapabilities::default()
                         }),
                         code_lens: Some(GenericCapability {
                             dynamic_registration: Some(true),
@@ -1197,10 +1273,11 @@ impl LanguageClient {
             },
         )?;
 
+        let initialize_result = InitializeResult::deserialize(&result)?;
         self.update(|state| {
             state
                 .capabilities
-                .insert(language_id.clone(), result.clone());
+                .insert(language_id.clone(), initialize_result);
             Ok(())
         })?;
 
@@ -1507,7 +1584,7 @@ impl LanguageClient {
             .map(|action_or_command| match action_or_command {
                 CodeActionOrCommand::Command(command) => CodeAction {
                     title: command.title.clone(),
-                    kind: Some(command.command.clone()),
+                    kind: Some(command.command.clone().into()),
                     diagnostics: None,
                     edit: None,
                     command: Some(command),
@@ -1992,12 +2069,14 @@ impl LanguageClient {
             .map(|cl| match &cl.command {
                 None => Err(anyhow!("no command, skipping")),
                 Some(cmd) => Ok(CodeAction {
-                    kind: Some(cmd.command.clone()),
+                    kind: Some(cmd.command.clone().into()),
                     title: cmd.title.clone(),
                     command: cl.clone().command,
                     diagnostics: None,
                     edit: None,
                     is_preferred: None,
+                    disabled: None,
+                    data: None,
                 }),
             })
             .filter(Result::is_ok)
@@ -2072,9 +2151,7 @@ impl LanguageClient {
         if let Some(initialize_result) = capabilities.get(&language_id) {
             // XXX: the capabilities state field stores the initialize result, not the capabilities
             // themselves, so we need to deserialize to InitializeResult.
-            let initialize_result: InitializeResult =
-                serde_json::from_value(initialize_result.clone())?;
-            let capabilities = initialize_result.capabilities;
+            let capabilities = initialize_result.capabilities.clone();
 
             if let Some(code_lens_provider) = capabilities.code_lens_provider {
                 info!("Begin {}", lsp_types::request::CodeLensRequest::METHOD);
@@ -2134,6 +2211,9 @@ impl LanguageClient {
         let filename = self.vim()?.get_filename(params)?;
         let language_id = self.vim()?.get_language_id(&filename, params)?;
         let text = self.vim()?.get_text(&filename)?;
+        let set_omnifunc: bool = self
+            .vim()?
+            .eval("s:GetVar('LanguageClient_setOmnifunc', v:true)")?;
 
         let text_document = TextDocumentItem {
             uri: filename.to_url()?,
@@ -2153,8 +2233,10 @@ impl LanguageClient {
             DidOpenTextDocumentParams { text_document },
         )?;
 
-        self.vim()?
-            .command("setlocal omnifunc=LanguageClient#complete")?;
+        if set_omnifunc {
+            self.vim()?
+                .command("setlocal omnifunc=LanguageClient#complete")?;
+        }
         let root = self.get(|state| state.roots.get(&language_id).cloned().unwrap_or_default())?;
         self.vim()?.rpcclient.notify(
             "setbufvar",
@@ -2258,6 +2340,7 @@ impl LanguageClient {
         self.get_client(&Some(language_id))?.notify(
             lsp_types::notification::DidSaveTextDocument::METHOD,
             DidSaveTextDocumentParams {
+                text: None,
                 text_document: TextDocumentIdentifier { uri },
             },
         )?;
@@ -2313,10 +2396,16 @@ impl LanguageClient {
         let filename = filename.canonicalize();
 
         let diagnostics_max_severity = self.get(|state| state.diagnostics_max_severity)?;
+        let ignore_sources = self.get(|state| state.diagnostics_ignore_sources.clone())?;
         let mut diagnostics = params
             .diagnostics
             .iter()
             .filter(|&diagnostic| {
+                if let Some(source) = &diagnostic.source {
+                    if ignore_sources.contains(source) {
+                        return false;
+                    }
+                }
                 diagnostic.severity.unwrap_or(DiagnosticSeverity::Hint) <= diagnostics_max_severity
             })
             .map(Clone::clone)
@@ -2703,7 +2792,7 @@ impl LanguageClient {
                     if !self.get(|state| state.watchers.contains_key(language_id))? {
                         let (watcher_tx, watcher_rx) = mpsc::channel();
                         // TODO: configurable duration.
-                        let watcher = notify::watcher(watcher_tx, Duration::from_secs(2))?;
+                        let watcher = FSWatch::new(watcher_tx, Duration::from_secs(2))?;
                         self.update(|state| {
                             state.watchers.insert(language_id.to_owned(), watcher);
                             state.watcher_rxs.insert(language_id.to_owned(), watcher_rx);
@@ -2714,13 +2803,25 @@ impl LanguageClient {
                     self.update(|state| {
                         if let Some(ref mut watcher) = state.watchers.get_mut(language_id) {
                             for w in &opt.watchers {
-                                let recursive_mode = if w.glob_pattern.ends_with("**") {
-                                    notify::RecursiveMode::Recursive
-                                } else {
-                                    notify::RecursiveMode::NonRecursive
-                                };
-                                watcher
-                                    .watch(w.glob_pattern.trim_end_matches("**"), recursive_mode)?;
+                                info!("Watching glob pattern: {}", &w.glob_pattern);
+                                for entry in glob(&w.glob_pattern)? {
+                                    match entry {
+                                        Ok(path) => {
+                                            if path.is_dir() {
+                                                watcher.watch_dir(
+                                                    &path,
+                                                    notify::RecursiveMode::Recursive,
+                                                )?;
+                                            } else {
+                                                watcher.watch_file(&path)?;
+                                            };
+                                            info!("Start watching path {:?}", path);
+                                        }
+                                        Err(e) => {
+                                            warn!("Error globbing for {}: {}", w.glob_pattern, e)
+                                        }
+                                    }
+                                }
                             }
                         }
                         Ok(())
@@ -3222,6 +3323,11 @@ impl LanguageClient {
         let mut virtual_texts = vec![];
         let use_virtual_text = self.get(|state| state.use_virtual_text.clone())?;
 
+        // code lens
+        if UseVirtualText::All == use_virtual_text || UseVirtualText::CodeLens == use_virtual_text {
+            virtual_texts.extend(self.virtual_texts_from_code_lenses(filename)?.into_iter());
+        }
+
         // diagnostics
         if UseVirtualText::All == use_virtual_text
             || UseVirtualText::Diagnostics == use_virtual_text
@@ -3230,11 +3336,6 @@ impl LanguageClient {
                 .virtual_texts_from_diagnostics(filename, viewport)?
                 .into_iter();
             virtual_texts.extend(vt_diagnostics);
-        }
-
-        // code lens
-        if UseVirtualText::All == use_virtual_text || UseVirtualText::CodeLens == use_virtual_text {
-            virtual_texts.extend(self.virtual_texts_from_code_lenses(filename)?.into_iter());
         }
 
         self.vim()?.set_virtual_texts(
@@ -3284,6 +3385,7 @@ impl LanguageClient {
         let mut virtual_texts = vec![];
         let code_lenses =
             self.get(|state| state.code_lens.get(filename).cloned().unwrap_or_default())?;
+        let code_lens_hl_group = self.get(|state| state.code_lens_hl_group.clone())?;
 
         for cl in code_lenses {
             if let Some(command) = cl.command {
@@ -3300,7 +3402,7 @@ impl LanguageClient {
                     None => virtual_texts.push(VirtualText {
                         line,
                         text,
-                        hl_group: "Comment".into(),
+                        hl_group: code_lens_hl_group.clone(),
                     }),
                 }
             }

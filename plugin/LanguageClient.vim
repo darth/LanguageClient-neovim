@@ -50,6 +50,10 @@ function! LanguageClient_textDocument_formatting(...)
     return call('LanguageClient#textDocument_formatting', a:000)
 endfunction
 
+function! LanguageClient_textDocument_formatting_sync(...)
+    return call('LanguageClient#textDocument_formatting_sync', a:000)
+endfunction
+
 function! LanguageClient_textDocument_rangeFormatting(...)
     return call('LanguageClient#textDocument_rangeFormatting', a:000)
 endfunction
@@ -106,6 +110,14 @@ function! LanguageClient_statusLine(...)
     return call('LanguageClient#statusLine', a:000)
 endfunction
 
+function! LanguageClient_diagnosticsPrevious(...)
+    return call('LanguageClient#diagnosticsPrevious', a:000)
+endfunction
+
+function! LanguageClient_diagnosticsNext(...)
+    return call('LanguageClient#diagnosticsNext', a:000)
+endfunction
+
 function! LanguageClient_statusLineDiagnosticsCounts(...)
     return call('LanguageClient#statusLineDiagnosticsCounts', a:000)
 endfunction
@@ -132,6 +144,10 @@ endfunction
 
 function! LanguageClient_explainErrorAtPoint(...)
     return call('LanguageClient#explainErrorAtPoint', a:000)
+endfunction
+
+function! LanguageClient_textDocument_switchSourceHeader(...)
+    return call('LanguageClient#textDocument_switchSourceHeader', a:000)
 endfunction
 
 command! -nargs=* LanguageClientStart :call LanguageClient#startServer(<f-args>)
@@ -174,4 +190,6 @@ augroup languageClient
     nnoremap <Plug>(lcn-explain-error)      :call LanguageClient_explainErrorAtPoint()<CR>
     nnoremap <Plug>(lcn-format)             :call LanguageClient_textDocument_formatting()<CR>
     nnoremap <Plug>(lcn-format-sync)        :call LanguageClient_textDocument_formatting_sync()<CR>
+    nnoremap <Plug>(lcn-diagnostics-next)   :call LanguageClient_diagnosticsNext()<CR>
+    nnoremap <Plug>(lcn-diagnostics-prev)   :call LanguageClient_diagnosticsPrevious()<CR>
 augroup END

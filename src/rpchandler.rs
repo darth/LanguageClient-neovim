@@ -1,4 +1,5 @@
-use crate::{language_client::LanguageClient, types::*};
+use crate::extensions::clangd;
+use crate::{language_client::LanguageClient, language_server_protocol::Direction, types::*};
 use anyhow::{anyhow, Result};
 use log::*;
 use lsp_types::notification::{self, Notification};
@@ -118,6 +119,10 @@ impl LanguageClient {
             REQUEST_SEMANTIC_SCOPES => self.semantic_scopes(&params),
             REQUEST_SHOW_SEMANTIC_HL_SYMBOLS => self.semantic_highlight_symbols(&params),
 
+            clangd::request::SwitchSourceHeader::METHOD => {
+                self.text_document_switch_source_header(&params)
+            }
+
             _ => {
                 let language_id_target = if language_id.is_some() {
                     // Message from language server. No handler found.
@@ -196,6 +201,10 @@ impl LanguageClient {
             NOTIFICATION_RUST_BEGIN_BUILD => self.rust_handle_begin_build(&params)?,
             NOTIFICATION_RUST_DIAGNOSTICS_BEGIN => self.rust_handle_diagnostics_begin(&params)?,
             NOTIFICATION_RUST_DIAGNOSTICS_END => self.rust_handle_diagnostics_end(&params)?,
+            NOTIFICATION_DIAGNOSTICS_NEXT => self.cycle_diagnostics(&params, Direction::Next)?,
+            NOTIFICATION_DIAGNOSTICS_PREVIOUS => {
+                self.cycle_diagnostics(&params, Direction::Previous)?
+            }
 
             _ => {
                 let language_id_target = if language_id.is_some() {
