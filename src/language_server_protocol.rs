@@ -3479,7 +3479,7 @@ impl LanguageClient {
         if lines.is_empty() {
             anyhow!("No selection!");
         }
-        let cmd = lines.get(0).ok_or_else(|| format_err!("Failed to get action! lines: {:?}", lines))?.to_owned();
+        let cmd = lines.get(0).ok_or_else(|| anyhow!("Failed to get action! lines: {:?}", lines))?.to_owned();
 
         let location = lines
             .get(1)
